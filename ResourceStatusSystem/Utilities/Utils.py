@@ -1,6 +1,9 @@
 """
-This module collects utility functions
+  This module collects utility functions
 """
+
+from DIRAC import gConfig
+import collections
 
 #############################################################################
 # useful functions
@@ -103,17 +106,112 @@ def convertTime(t, inTo = None):
 ############################
 
 from itertools import imap
-import copy
+import copy, ast, socket
 
 id_fun = lambda x: x
+
+# Import utils
+
+def voimport(base_mod):
+  for ext in gConfig.getValue("DIRAC/Extensions", []):
+    try:
+      return  __import__(ext + base_mod, globals(), locals(), ['*'])
+    except ImportError:
+      continue
+  # If not found in extensions, import it in DIRAC base.
+  return  __import__(base_mod, globals(), locals(), ['*'])
+
+# socket utils
+
+def canonicalURL(url):
+  try:
+    canonical = socket.gethostbyname_ex(url)[0]
+    return canonical
+  except:
+    return url
+
+# RPC utils
+
+class RPCError(Exception):
+  pass
+
+def unpack(dirac_value):
+  if type(dirac_value) != dict:
+    raise ValueError, "Not a DIRAC value."
+  if 'OK' not in dirac_value.keys():
+    raise ValueError, "Not a DIRAC value."
+  try:
+    return dirac_value['Value']
+  except KeyError:
+    raise RPCError, dirac_value['Message']
+
+def protect2(f, *args, **kw):
+  """Wrapper protect"""
+  try:
+    ret = f(*args, **kw)
+    if type(ret) == dict and ret['OK'] == False:
+      print "function " + f.f.__name__ + " called with " + str( args )
+      print "%s\n" % ret['Message']
+    return ret
+  except Exception as e:
+    print "function " + str(f) + " called with " + str(args)
+    raise e
 
 # (Duck) type checking
 
 def isiterable(obj):
-  import collections
   return isinstance(obj,collections.Iterable)
 
+# Type conversion
+
+def bool_of_string(s):
+  """Convert a string into a boolean in a SANE manner."""
+  if s.lower() == "true"    : return True
+  elif s.lower() == "false" : return False
+  else                      : raise ValueError, "Cannot convert %s to a boolean value" % s
+
+def typedobj_of_string(s):
+  if s == '_none_':
+    return []
+  if s == '': #isinstance( s, str ):
+    return [ s ]
+  try:
+    return ast.literal_eval(s)
+  except (ValueError, SyntaxError): # Probably it's just a string
+    return s
+
+# String utils
+
+# http://en.wikibooks.org/wiki/Algorithm_Implementation/Strings/Longest_common_substring#Python
+def LongestCommonSubstring(S1, S2):
+  M = [[0]*(1+len(S2)) for i in xrange(1+len(S1))]
+  longest, x_longest = 0, 0
+  for x in xrange(1,1+len(S1)):
+    for y in xrange(1,1+len(S2)):
+      if S1[x-1] == S2[y-1]:
+        M[x][y] = M[x-1][y-1] + 1
+        if M[x][y]>longest:
+          longest = M[x][y]
+          x_longest  = x
+      else:
+        M[x][y] = 0
+  return S1[x_longest-longest: x_longest]
+
+def CountCommonLetters(S1, S2):
+  count = 0
+  target = S2
+  for l in S1:
+    if l in S2:
+      count = count+1
+      target = target.strip(l)
+  return count
+
 # List utils
+
+def list_(a):
+  """Same as list() except if arg is a string, in this case, return
+  [a]"""
+  return (list(a) if type(a) != str else [a])
 
 def list_split(l):
   return [i[0] for i in l], [i[1] for i in l]
@@ -122,13 +220,47 @@ def list_combine(l1, l2):
   return list(imap(lambda x,y: (x,y), l1, l2))
 
 def list_flatten(l):
-  res = []
-  for e in l:
-    for ee in e:
-      res.append(ee)
-  return res
+  try:
+    return [ee for e in l for ee in e]
+  except TypeError:
+    return l
+
+def list_sanitize(l):
+  """Remove doublons and results that evaluate to false"""
+  try:
+    return list(set([i for i in l if i]))
+  except TypeError:
+    return [i for i in l if i]
+
+def set_sanitize(l):
+  """Remove doublons and results that evaluate to false"""
+  try:
+    return set([i for i in l if i])
+  except TypeError:
+    return [i for i in l if i]
 
 # Dict utils
+
+def dictMatch(dict1, dict2):
+  """Checks if fields of dict1 are in fields of dict2. Returns True if
+  it is the case and False otherwise."""
+  if type(dict1) != type(dict2) != dict:
+    raise TypeError, "dictMatch expect dicts for both arguments"
+
+  numMatch = False
+
+  for k in dict1:
+    try:
+      if dict1[k] == None:
+        continue
+      if dict1[k] not in dict2[k]:
+        return False
+      else:
+        numMatch = True
+    except KeyError:
+      pass
+
+  return numMatch
 
 def dict_split(d):
   def dict_one_split(d):
@@ -151,83 +283,29 @@ def dict_split(d):
 
   return dict_split([d])
 
-# CLI stuff
-
-class GetForm(object):
-  """This class asks the user to fill a form inside a CLI. It checks
-  the type of entered values and keep on asking them until the form
-  has the correct type."""
-
-  prompt = "> "
-  form   = None
-
-  def __init__(self, form):
-    """form is a dict in the form label:<type or set of values>"""
-    self.form = form
-
-  def run(self):
-    res = {}
-    for i in self.form:
-      res[i] = self.getval(i, self.form[i])
-    return res
-
-  def getval(self, label, restr, acceptFalse=False):
-    """Restriction can be based on a type, or on a list of acceptable
-    values. If valueTrue, then the value provided"""
-    value = None
-
-    if type(restr) == type:
-      # Checks that the provided value is of type restr.
-      if not acceptFalse:
-        while type(value) != restr or not value:
-          print "Enter value for %s: %s" % (label, str(restr))
-          value = raw_input(self.prompt)
-      else:
-        while type(value) != restr:
-          print "Enter value for %s: %s" % (label, str(restr))
-          value = raw_input(self.prompt)
-
-      return value
-
-    else:
-      # Checks that the provided value(s) are in the iterable
-
-      if not acceptFalse:
-        while not value:
-          print "Enter value for %s: " % label
-          value = self.pickvals(restr)
-      else:
-        print "Enter value for %s: " % label
-        value = self.pickvals(restr)
-
-      return value
-
-  def pickvals(self, iterable, NoneAllowed=False, AllAllowed=True):
-    """Ask the user to pick one or more value(s) in a iterable (list,
-    set). Return the list of chosen values"""
-    res = None
-
-    while res == None:
+def dict_invert(dict_):
+  res = {}
+  for k in dict_:
+    if not isiterable(dict_[k]):
+      dict_[k] = [dict_[k]]
+    for i in dict_[k]:
       try:
-        self.print_iterable(iterable, NoneAllowed, AllAllowed)
-        res = [int(i) for i in raw_input(self.prompt).split()]
-      except ValueError:
-        pass
+        res[i].append(k)
+      except KeyError:
+        res[i] = [k]
 
-    if AllAllowed and (len(iterable) in res or res == []):
-      return iterable
-    elif NoneAllowed and res == [-1]:
-      return []
-    else:
-      return [iterable[i] for i in res if i in range(0, len(iterable))]
+  return res
 
-  def print_iterable(self, iterable, NoneAllowed=False, AllAllowed=True):
-    """Prints an iterable with numbering to enable a user to pick some
-    or all elements by typing the numbers. To be used by an input function.
-    """
-    if NoneAllowed:
-      print "(-1) [Nothing]"
-    for idx, value in enumerate(iterable):
-      print "(%d) [%s]" % (idx, value)
-    if AllAllowed:
-      print "(%d) [All] (default)" % len(iterable)
+# XML utils
+
+def xml_append(doc, tag, value_=None, elt_=None, **kw):
+  new_elt = doc.createElement(tag)
+  for k in kw:
+    new_elt.setAttribute(k, str(kw[k]))
+  if value_ != None:
+    textnode = doc.createTextNode(str(value_))
+    new_elt.appendChild(textnode)
+  if elt_ != None:
+    return elt_.appendChild(new_elt)
+  else:
+    return doc.documentElement.appendChild(new_elt)

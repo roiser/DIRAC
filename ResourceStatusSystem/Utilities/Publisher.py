@@ -1,29 +1,30 @@
-########################################################################
+################################################################################
 # $HeadURL:  $
-########################################################################
-
+################################################################################
 __RCSID__ = "$Id:  $"
 
 import copy
 import threading
 
-from DIRAC.Core.Utilities.ThreadPool import ThreadPool
-from DIRAC.Core.Utilities.SitesDIRACGOCDBmapping import getGOCSiteName
+from DIRAC.Core.Utilities.ThreadPool                    import ThreadPool
+from DIRAC.Core.Utilities.SitesDIRACGOCDBmapping        import getGOCSiteName
 
-from DIRAC.ResourceStatusSystem.Utilities.CS import getStorageElementStatus
+from DIRAC.ResourceStatusSystem.Utilities.CS            import getStorageElementStatus
 
-from DIRAC.ResourceStatusSystem.PolicySystem.Configurations import ValidRes
-from DIRAC.ResourceStatusSystem.Utilities.Utils import where
-from DIRAC.ResourceStatusSystem.Utilities.Exceptions import RSSException, InvalidRes
+from DIRAC.ResourceStatusSystem                         import ValidRes
+from DIRAC.ResourceStatusSystem.Utilities               import Utils
+from DIRAC.ResourceStatusSystem.Utilities.Exceptions    import RSSException, InvalidRes
 
-
+from DIRAC.ResourceStatusSystem.DB.ResourceStatusDB     import ResourceStatusDB
+from DIRAC.ResourceStatusSystem.DB.ResourceManagementDB import ResourceManagementDB
+from DIRAC.ResourceStatusSystem.Command.CommandCaller   import CommandCaller
+from DIRAC.ResourceStatusSystem.Utilities.InfoGetter    import InfoGetter
+from DIRAC.Core.DISET.RPCClient                         import RPCClient
 
 class Publisher:
   """
   Class Publisher is in charge of getting dispersed information, to be published on the web.
   """
-
-#############################################################################
 
   def __init__(self, VOExtension, rsDBIn = None, commandCallerIn = None, infoGetterIn = None,
                WMSAdminIn = None):
@@ -46,40 +47,18 @@ class Publisher:
       (see :class: `DIRAC.Core.DISET.RPCClient.RPCClient`)
     """
 
-    self.configModule = __import__(VOExtension+"DIRAC.ResourceStatusSystem.Policy.Configurations",
-                                   globals(), locals(), ['*'])
+    self.configModule     = Utils.voimport("DIRAC.ResourceStatusSystem.Policy.Configurations", VOExtension)
 
-    if rsDBIn is not None:
-      self.rsDB = rsDBIn
-    else:
-      from DIRAC.ResourceStatusSystem.DB.ResourceStatusDB import ResourceStatusDB
-      self.rsDB = ResourceStatusDB()
-
-    if commandCallerIn is not None:
-      self.cc = commandCallerIn
-    else:
-      from DIRAC.ResourceStatusSystem.Command.CommandCaller import CommandCaller
-      self.cc = CommandCaller()
-
-    if infoGetterIn is not None:
-      self.ig = infoGetterIn
-    else:
-      from DIRAC.ResourceStatusSystem.Utilities.InfoGetter import InfoGetter
-      self.ig = InfoGetter(VOExtension)
-
-    if WMSAdminIn is not None:
-      self.WMSAdmin = WMSAdminIn
-    else:
-      from DIRAC.Core.DISET.RPCClient import RPCClient
-      self.WMSAdmin = RPCClient("WorkloadManagement/WMSAdministrator")
-
-    self.threadPool = ThreadPool( 2, 5 )
-
-    self.lockObj = threading.RLock()
-
+    self.rsDB             = ResourceStatusDB() if rsDBIn == None else rsDBIn
+    self.rmDB             = ResourceManagementDB()
+    self.cc               = CommandCaller() if commandCallerIn == None else commandCallerIn
+    self.ig               = InfoGetter(VOExtension) if infoGetterIn == None else infoGetterIn
+    self.WMSAdmin         = RPCClient("WorkloadManagement/WMSAdministrator") if WMSAdminIn == None else WMSAdminIn
+    self.threadPool       = ThreadPool( 2, 5 )
+    self.lockObj          = threading.RLock()
     self.infoForPanel_res = {}
 
-#############################################################################
+################################################################################
 
   def getInfo(self, granularity, name, useNewRes = False):
     """
@@ -99,7 +78,7 @@ class Publisher:
     """
 
     if granularity not in ValidRes:
-      raise InvalidRes, where(self, self.getInfo)
+      raise InvalidRes, Utils.where(self, self.getInfo)
 
     self.infoForPanel_res = {}
 
@@ -192,13 +171,13 @@ class Publisher:
 
     return infoToGet_res
 
-#############################################################################
+################################################################################
 
   def getInfoForPanel(self, info, granularityForPanel, nameForPanel):
 
     #get single RSS policy results
     policyResToGet = info.keys()[0]
-    pol_res = self.rsDB.getPolicyRes(nameForPanel, policyResToGet)
+    pol_res = self.rmDB.getPolicyResult(nameForPanel, policyResToGet)
     if pol_res != []:
       pol_res_dict = {'Status' : pol_res[0], 'Reason' : pol_res[1]}
     else:
@@ -220,12 +199,12 @@ class Publisher:
     info_res = {}
 
     for oi in othersInfo:
-      format = oi.keys()[0]
+      format_ = oi.keys()[0]
       what = oi.values()[0]
 
-      info_bit_got = self._getInfo(granularityForPanel, nameForPanel, format, what)
+      info_bit_got = self._getInfo(granularityForPanel, nameForPanel, format_, what)
 
-      info_res[format] = info_bit_got
+      info_res[format_] = info_bit_got
 
     self.lockObj.acquire()
     try:
@@ -234,7 +213,7 @@ class Publisher:
     finally:
       self.lockObj.release()
 
-#############################################################################
+################################################################################
 
   def _getStatus(self, name, panel):
 
@@ -249,7 +228,7 @@ class Publisher:
         if DIRACStatus['OK']:
           DIRACStatus = DIRACStatus['Value'][name].pop()[0]
         else:
-          raise RSSException, where(self, self._getStatus)
+          raise RSSException, Utils.where(self, self._getStatus)
 
       elif panel == 'SE_Panel':
         ra = getStorageElementStatus(name, 'ReadAccess')['Value']
@@ -264,11 +243,11 @@ class Publisher:
 
     return status
 
-#############################################################################
+################################################################################
 
-  def _getInfo(self, granularity, name, format, what):
+  def _getInfo(self, granularity, name, format_, what):
 
-    if format == 'RSS':
+    if format_ == 'RSS':
       info_bit_got = self._getInfoFromRSSDB(name, what)
     else:
       if isinstance(what, dict):
@@ -288,7 +267,7 @@ class Publisher:
 
     return info_bit_got
 
-#############################################################################
+################################################################################
 
   def _getInfoFromRSSDB(self, name, what):
 
@@ -378,13 +357,13 @@ class Publisher:
 
     return info_bit_got
 
-#############################################################################
+################################################################################
 
   def _getPolicyDesc(self, policyName):
 
     return self.configModule.Policies[policyName]['Description']
 
-#############################################################################
+################################################################################
 
   def __getNameForPanel(self, granularity, name, panel):
 
@@ -413,7 +392,7 @@ class Publisher:
 
     return (granularity, name)
 
-#############################################################################
+################################################################################
 
   def _resExist(self, granularity, name):
 
@@ -440,4 +419,15 @@ class Publisher:
     else:
       return True
 
-#############################################################################
+################################################################################
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+################################################################################
+
+'''
+  HOW DOES THIS WORK.
+
+    will come soon...
+'''
+
+################################################################################
+#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF

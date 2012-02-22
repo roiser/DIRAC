@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 ########################################################################
 # $HeadURL$
 # File :    dirac-distribution-create-tarball
@@ -242,6 +243,7 @@ class TarModuleCreator( object ):
               if po2.returncode:
                 continue
               toReplace = po2.stdout.read().strip()
+              toReplace = "".join( i for i in toReplace if ord( i ) < 128 )
               fileContents = fileContents.replace( keyWord, toReplace )
               changed = True
 
@@ -310,11 +312,10 @@ class TarModuleCreator( object ):
       line = rawLine.strip()
       if not line:
         continue
-      if version == False:
-        if line[0] == "[" and line[-1] == "]":
-          version = line[1:-1].strip()
-          relData.append( ( version, { 'comment' : [], 'features' : [] } ) )
-          feature = False
+      if line[0] == "[" and line[-1] == "]":
+        version = line[1:-1].strip()
+        relData.append( ( version, { 'comment' : [], 'features' : [] } ) )
+        feature = False
         continue
       if line[0] == "*":
         feature = line[1:].strip()
@@ -413,8 +414,12 @@ class TarModuleCreator( object ):
       gLogger.notice( "Compiled %s file!" % rstFileName )
     return S_OK()
 
-
   def __compileReleaseNotes( self, rstFile ):
+    notesName = rstFile
+    for ext in ( '.rst', '.txt' ):
+      if rstFile[ -len( ext ): ] == ext:
+        notesName = rstFile[ :-len( ext ) ]
+        break
     relNotesRST = os.path.join( self.params.destination, self.params.name, rstFile )
     if not os.path.isfile( relNotesRST ):
       if self.params.relNotes:
@@ -425,11 +430,12 @@ class TarModuleCreator( object ):
     except ImportError:
       return S_ERROR( "Docutils is not installed. Please install and rerun" )
     #Find basename
-    baseNotesPath = relNotesRST
+    baseRSTFile = rstFile
     for ext in ( '.rst', '.txt' ):
-      if relNotesRST[ -len( ext ): ] == ext:
-        baseNotesPath = relNotesRST[ :-len( ext ) ]
+      if baseRSTFile[ -len( ext ): ] == ext:
+        baseRSTFile = baseRSTFile[ :-len( ext ) ]
         break
+    baseNotesPath = os.path.join( self.params.destination, self.params.name, baseRSTFile )
     #To HTML
     try:
       fd = open( relNotesRST )
@@ -443,9 +449,8 @@ class TarModuleCreator( object ):
       return S_ERROR( "Cannot generate the html %s: %s" % ( baseNotesPath, str( excp ) ) )
     baseList = [ baseNotesPath ]
     if self.params.outRelNotes:
-      print "ASDAS"
       gLogger.notice( "Leaving a copy of the release notes outside the tarballs" )
-      baseList.append( "%s/releasenotes.%s.%s" % ( self.params.destination, self.params.name, self.params.version ) )
+      baseList.append( "%s/%s.%s.%s" % ( self.params.destination, baseRSTFile, self.params.name, self.params.version ) )
     for baseFileName in baseList:
       htmlFileName = baseFileName + ".html"
       try:
@@ -460,7 +465,7 @@ class TarModuleCreator( object ):
       if os.system( pdfCmd ):
         gLogger.warn( "Could not generate PDF version of %s" % baseNotesPath )
     #Unlink if not necessary
-    if not cliParams.relNotes:
+    if False and not cliParams.relNotes:
       try:
         os.unlink( relNotesRST )
       except:
@@ -537,3 +542,4 @@ if __name__ == "__main__":
     gLogger.error( "Could not create the tarball: %s" % result[ 'Message' ] )
     sys.exit( 1 )
   gLogger.always( "Tarball successfully created at %s" % result[ 'Value' ] )
+  sys.exit( 0 )

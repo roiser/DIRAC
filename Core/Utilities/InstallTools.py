@@ -378,7 +378,7 @@ def _getCentralCfg( installCfg ):
 
   # Add the master Host description
   if hostDN:
-    hostSection = cfgPath( 'Registry', 'Hosts', host ) 
+    hostSection = cfgPath( 'Registry', 'Hosts', host )
     if not centralCfg.isSection( hostSection ):
        centralCfg.createNewSection( hostSection )
     if centralCfg['Registry']['Hosts'][host].existsKey( 'DN' ):
@@ -976,10 +976,12 @@ def runsvctrlComponent( system, component, mode ):
     return S_ERROR( 'Unknown runsvctrl mode "%s"' % mode )
 
   startCompDirs = glob.glob( os.path.join( startDir, '%s_%s' % ( system, component ) ) )
-  result = execCommand( 0, ['runsvctrl', mode] + startCompDirs )
-  if not result['OK']:
-    return result
-  time.sleep( 1 )
+  startCompList = [ [k] for k in startCompDirs]
+  for startComp in startCompList:
+    result = execCommand( 0, ['runsvctrl', mode] + startComp )
+    if not result['OK']:
+      return result
+    time.sleep( 1 )
 
   # Check the runsv status
   if system == '*' or component == '*':
@@ -1164,6 +1166,13 @@ def setupSite( scriptCfg, cfg = None ):
     _addCfgToDiracCfg( cfg )
     cfg = __getCfg( cfgPath( 'DIRAC', 'Configuration' ), 'Master' , 'yes' )
     cfg.setOption( cfgPath( 'DIRAC', 'Configuration', 'Name' ) , setupConfigurationName )
+    serversCfgPath = cfgPath( 'DIRAC', 'Configuration', 'Servers' )
+    if not localCfg.getOption( serversCfgPath , [] ):
+      serverUrl = 'dips://%s:9135/Configuration/Server' % host
+      cfg.setOption( serversCfgPath, serverUrl )
+      from DIRAC.ConfigurationSystem.Client.ConfigurationData import gConfigurationData
+      gConfigurationData.setOptionInCFG( serversCfgPath, serverUrl )
+
     _addCfgToDiracCfg( cfg )
     addDefaultOptionsToComponentCfg( 'service', 'Configuration', 'Server', [] )
     if installCfg:
