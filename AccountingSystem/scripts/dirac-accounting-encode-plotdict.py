@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 ########################################################################
-# $HeadURL: 
+# $HeadURL:  
 # File :    dirac-accounting-encode-plotdict
 # Author :  Stefan Roiser
 ########################################################################
