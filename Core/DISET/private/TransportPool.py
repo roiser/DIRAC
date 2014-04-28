@@ -91,7 +91,7 @@ class TransportPool:
     try:
       return self.__transports[ trid ][0]
     except KeyError:
-      return False
+      return None
 
   # Receive
   def receive( self, trid, maxBufferSize = 0, blockAfterKeepAlive = True, idleReceive = False ):
@@ -120,7 +120,7 @@ class TransportPool:
     except KeyError:
       return S_ERROR( "No transport with id %s defined" % trid )
     else:
-      self.__close( trid )
+      self.close( trid )
 
   def sendAndClose( self, trid, msg ):
     try:
@@ -156,7 +156,7 @@ class TransportPool:
       self.__modLock.release()
 
 
-gTransportPool = False
+gTransportPool = None
 
 def getGlobalTransportPool():
   global gTransportPool

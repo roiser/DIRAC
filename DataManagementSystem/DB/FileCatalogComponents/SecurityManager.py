@@ -6,25 +6,36 @@
 
 __RCSID__ = "$Id$"
 
-import time,os
-from DIRAC import S_OK, S_ERROR, gConfig
-from DIRAC.Core.Security.CS import getPropertiesForGroup
-from DIRAC.Core.Security.Properties import *
+import os
+from DIRAC import S_OK, S_ERROR
+from DIRAC.Core.Security.Properties import FC_MANAGEMENT
 
 class SecurityManagerBase:
-  
-  def __init__(self,database=False):
+
+  def __init__( self, database=None ):
     self.db = database
-    
-  def setDatabase(self,database):
+
+  def setDatabase( self, database ):
     self.db = database
-    
-  def getPathPermissions(self,paths,credDict):
-    """ Get path permissions according to the policy 
-    """  
+
+  def getPathPermissions( self, paths, credDict ):
+    """ Get path permissions according to the policy
+    """
     return S_ERROR('The getPathPermissions method must be implemented in the inheriting class')
-  
+
   def hasAccess(self,opType,paths,credDict):
+    
+    # Check if admin access is granted first
+    result = self.hasAdminAccess( credDict )
+    if not result['OK']:
+      return result
+    if result['Value']:
+      # We are admins, allow everything
+      permissions = {}
+      for path in paths:
+        permissions[path] = True
+      return S_OK( {'Successful':permissions,'Failed':{}} )
+    
     successful = {}
     failed = {}
     if not opType.lower() in ['read','write','execute']:
@@ -34,11 +45,11 @@ class SecurityManagerBase:
         successful[path] = True
       resDict = {'Successful':successful,'Failed':{}}
       return S_OK(resDict)
-    
+
     result = self.getPathPermissions(paths,credDict)
     if not result['OK']:
       return result
-    
+
     permissions = result['Value']['Successful']
     for path,permDict in permissions.items():
       if permDict[opType]:
@@ -49,8 +60,7 @@ class SecurityManagerBase:
     return S_OK(resDict)
 
   def hasAdminAccess(self,credDict):
-    group = credDict.get('group','')
-    if FC_MANAGEMENT in getPropertiesForGroup(group):
+    if FC_MANAGEMENT in credDict['properties']:
       return S_OK(True)
     return S_OK(False)
 
@@ -59,13 +69,13 @@ class NoSecurityManager(SecurityManagerBase):
   def getPathPermissions(self,paths,credDict):
     """ Get path permissions according to the policy
     """
-    
+
     permissions = {}
     for path in paths:
       permissions[path] = {'Read':True,'Write':True,'Execute':True}
-      
-    return S_OK( {'Successful':permissions,'Failed':{}} )  
-  
+
+    return S_OK( {'Successful':permissions,'Failed':{}} )
+
   def hasAccess(self,opType,paths,credDict):
     successful = {}
     for path in paths:
@@ -77,10 +87,11 @@ class NoSecurityManager(SecurityManagerBase):
     return S_OK(True)
 
 class DirectorySecurityManager(SecurityManagerBase):
-  
+
   def getPathPermissions(self,paths,credDict):
     """ Get path permissions according to the policy
     """
+    
     toGet = dict(zip(paths,[ [path] for path in paths ]))
     permissions = {}
     failed = {}
@@ -91,7 +102,7 @@ class DirectorySecurityManager(SecurityManagerBase):
       for path,mode in res['Value']['Successful'].items():
         for resolvedPath in toGet[path]:
           permissions[resolvedPath] = mode
-        toGet.pop(path)  
+        toGet.pop(path)
       for path,error in res['Value']['Failed'].items():
         if error != 'No such file or directory':
           for resolvedPath in toGet[path]:
@@ -105,18 +116,19 @@ class DirectorySecurityManager(SecurityManagerBase):
           toGet[os.path.dirname(path)] = []
         toGet[os.path.dirname(path)] += resolvedPaths
         toGet.pop(path)
-      
-    if self.db.globalReadAccess:    
+
+    if self.db.globalReadAccess:
       for path in permissions:
         permissions[path]['Read'] = True
-        
-    return S_OK( {'Successful':permissions,'Failed':failed} )    
+
+    return S_OK( {'Successful':permissions,'Failed':failed} )
 
 class FullSecurityManager(SecurityManagerBase):
-  
+
   def getPathPermissions(self,paths,credDict):
     """ Get path permissions according to the policy
     """
+    
     toGet = dict(zip(paths,[ [path] for path in paths ]))
     permissions = {}
     failed = {}
@@ -143,7 +155,7 @@ class FullSecurityManager(SecurityManagerBase):
       for path,mode in res['Value']['Successful'].items():
         for resolvedPath in toGet[path]:
           permissions[resolvedPath] = mode
-        toGet.pop(path)  
+        toGet.pop(path)
       for path,error in res['Value']['Failed'].items():
         if error != 'No such file or directory':
           for resolvedPath in toGet[path]:
@@ -157,9 +169,9 @@ class FullSecurityManager(SecurityManagerBase):
           toGet[os.path.dirname(path)] = []
         toGet[os.path.dirname(path)] += resolvedPaths
         toGet.pop(path)
-    
-    if self.db.globalReadAccess:    
+
+    if self.db.globalReadAccess:
       for path in permissions:
         permissions[path]['Read'] = True
-        
-    return S_OK( {'Successful':permissions,'Failed':failed} )    
+
+    return S_OK( {'Successful':permissions,'Failed':failed} )

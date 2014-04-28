@@ -2,7 +2,8 @@
 
 __RCSID__ = "$Id$"
 
-from DIRAC                                      import gLogger, gConfig, S_OK, S_ERROR
+from DIRAC                                      import gLogger, S_OK, S_ERROR
+from DIRAC.Resources.Utilities.Utils            import checkArgumentFormat
 from DIRAC.Resources.Storage.StorageBase        import StorageBase
 from DIRAC.Core.Utilities.Subprocess            import shellCall
 from DIRAC.Core.Utilities.Pfn                   import pfnparse, pfnunparse
@@ -277,7 +278,7 @@ class RFIOStorage( StorageBase ):
   def getFile( self, path, localPath = False ):
     """ Get a local copy in the current directory of a physical file specified by its path
     """
-    res = self.__checkArgumentFormatDict( path )
+    res = checkArgumentFormat( path )
     if not res['OK']:
       return res
     urls = res['Value']
@@ -310,7 +311,7 @@ class RFIOStorage( StorageBase ):
     if not res['OK']:
       return S_ERROR( res['Message'] )
     remoteSize = res['Value']
-    MIN_BANDWIDTH = 1024 * 100 # 100 KB/s
+    MIN_BANDWIDTH = 1024 * 100  # 100 KB/s
     timeout = remoteSize / MIN_BANDWIDTH + 300
     gLogger.debug( "RFIOStorage.getFile: Executing transfer of %s to %s" % ( src_url, dest_file ) )
     comm = "rfcp %s %s" % ( src_url, dest_file )
@@ -339,7 +340,7 @@ class RFIOStorage( StorageBase ):
     return S_ERROR( errorMessage )
 
   def putFile( self, path, sourceSize = 0 ):
-    res = self.__checkArgumentFormatDict( path )
+    res = checkArgumentFormat( path )
     if not res['OK']:
       return res
     urls = res['Value']
@@ -388,7 +389,7 @@ class RFIOStorage( StorageBase ):
       return res
     turl = res['Value']
 
-    MIN_BANDWIDTH = 1024 * 100 # 100 KB/s
+    MIN_BANDWIDTH = 1024 * 100  # 100 KB/s
     timeout = sourceSize / MIN_BANDWIDTH + 300
     gLogger.debug( "RFIOStorage.putFile: Executing transfer of %s to %s" % ( src_file, turl ) )
     comm = "rfcp %s '%s'" % ( src_file, turl )
@@ -569,7 +570,7 @@ class RFIOStorage( StorageBase ):
   def prestageFileStatus( self, path ):
     """ Monitor the status of a prestage request
     """
-    res = self.__checkArgumentFormatDict( path )
+    res = checkArgumentFormat( path )
     if not res['OK']:
       return res
     urls = res['Value']
@@ -784,7 +785,7 @@ class RFIOStorage( StorageBase ):
   def putDirectory( self, path ):
     """ Put a local directory to the physical storage together with all its files and subdirectories.
     """
-    res = self.__checkArgumentFormatDict( path )
+    res = checkArgumentFormat( path )
     if not res['OK']:
       return res
     urls = res['Value']
@@ -1042,7 +1043,7 @@ class RFIOStorage( StorageBase ):
       directorySize = 0
       directoryFiles = 0
       filesDict = dirDict['Files']
-      for fileURL, fileDict in filesDict.items():
+      for _fileURL, fileDict in filesDict.items():
         directorySize += fileDict['Size']
         directoryFiles += 1
       gLogger.debug( "RFIOStorage.getDirectorySize: Successfully obtained size of %s." % directory )
@@ -1061,32 +1062,18 @@ class RFIOStorage( StorageBase ):
       return S_ERROR( "RFIOStorage.__checkArgumentFormat: Supplied path is not of the correct format." )
     return S_OK( urls )
 
-  def __checkArgumentFormatDict( self, path ):
-    if type( path ) in types.StringTypes:
-      urls = {path:False}
-    elif type( path ) == types.ListType:
-      urls = {}
-      for url in path:
-        urls[url] = False
-    elif type( path ) == types.DictType:
-      urls = path
-    else:
-      return S_ERROR( "RFIOStorage.checkArgumentFormat: Supplied path is not of the correct format." )
-    return S_OK( urls )
-
   def __executeOperation( self, url, method ):
     """ Executes the requested functionality with the supplied url
     """
-    execString = "res = self.%s(url)" % method
-    try:
-      exec( execString )
-      if not res['OK']:
-        return S_ERROR( res['Message'] )
-      elif not res['Value']['Successful'].has_key( url ):
+    fcn = None
+    if hasattr( self, method ) and callable( getattr( self, method ) ):
+      fcn = getattr( self, method )
+    if not fcn:
+      return S_ERROR( "Unable to invoke %s, it isn't a member funtion of RFIOStorage" % method )
+    res = fcn( url )
+    if not res['OK']:
+      return res
+    elif url not in res['Value']['Successful']:
         return S_ERROR( res['Value']['Failed'][url] )
-      else:
-        return S_OK( res['Value']['Successful'][url] )
-    except AttributeError, errMessage:
-      exceptStr = "RFIOStorage.__executeOperation: Exception while performing %s." % method
-      gLogger.exception( exceptStr, '', errMessage )
-      return S_ERROR( "%s%s" % ( exceptStr, errMessage ) )
+    return S_OK( res['Value']['Successful'][url] )
+

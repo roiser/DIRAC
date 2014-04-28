@@ -1,6 +1,8 @@
 -- THESE ARE THE TABLES FOR THE TRANSFER DB
 -- Channels,Channel,FTSReq,FileToFTS,FTSReqLogging,FileToCat,ReplicationTree
 
+USE TransferDB;
+
 DROP TABLE IF EXISTS Channels;
 CREATE TABLE Channels (
    ChannelID INTEGER NOT NULL AUTO_INCREMENT,
@@ -20,18 +22,18 @@ CREATE TABLE Channel (
   FileID INTEGER NOT NULL,
   Status VARCHAR(32) NOT NULL,
   INDEX(Status),
-  SourceSE varchar(256) NOT NULL,
+  SourceSE varchar(255) NOT NULL,
   INDEX(SourceSE),
-  SourceSURL varchar(256)  NOT NULL,
-  TargetSE varchar(256) NOT NULL,
+  SourceSURL varchar(255)  NOT NULL,
+  TargetSE varchar(255) NOT NULL,
   INDEX(TargetSE),
-  TargetSURL varchar(256)  NOT NULL,
+  TargetSURL varchar(255)  NOT NULL,
   FileSize bigint(20) NOT NULL,
   Retries INTEGER DEFAULT 0,
   SchedulingTime DATETIME NOT NULL,
-  SchedulingTimeOrder DOUBLE(11,3) NOT NULL,
+  SchedulingTimeOrder DOUBLE(12,3) NOT NULL,
   LastUpdate DATETIME NOT NULL,
-  LastUpdateTimeOrder DOUBLE(11,3) NOT NULL,
+  LastUpdateTimeOrder DOUBLE(12,3) NOT NULL,
   CompletionTime DATETIME,
   PRIMARY KEY (ChannelID,FileID)
 )ENGINE=INNODB;
@@ -45,8 +47,8 @@ CREATE TABLE FTSReq (
   INDEX(Status),
   FTSGUID varchar(64) NOT NULL,
   FTSServer varchar(255) NOT NULL,
-  SourceSE varchar(256) DEFAULT '',
-  TargetSE varchar(256) DEFAULT '',
+  SourceSE varchar(255) DEFAULT '',
+  TargetSE varchar(255) DEFAULT '',
   NumberOfFiles INTEGER DEFAULT 0,
   TotalSize bigint(20) DEFAULT 0,
   SubmitTime datetime NOT NULL,

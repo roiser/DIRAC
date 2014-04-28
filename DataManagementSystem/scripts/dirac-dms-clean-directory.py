@@ -4,6 +4,7 @@
 ########################################################################
 __RCSID__   = "$Id:  $"
 
+from DIRAC           import exit as DIRACExit
 from DIRAC.Core.Base import Script 
 
 Script.setUsageMessage("""
@@ -22,7 +23,7 @@ from DIRAC.Core.Utilities.List import sortList,randomize
 
 if len(sys.argv) < 2:
   Script.showHelp()
-  DIRAC.exit( -1 )
+  DIRACExit( -1 )
 else:
   inputFileName = sys.argv[1]
 
@@ -34,14 +35,14 @@ if os.path.exists(inputFileName):
 else:
   lfns = [inputFileName]
 
-from DIRAC.DataManagementSystem.Client.ReplicaManager import ReplicaManager
-rm = ReplicaManager()
+from DIRAC.DataManagementSystem.Client.DataManager import DataManager
+dm = DataManager()
 for lfn in sortList(lfns):
   lfn = lfn.strip()
   if not lfn: continue
   print "Cleaning directory %s ... " % lfn,
   sys.stdout.flush()
-  result = rm.cleanLogicalDirectory(lfn)
+  result = dm.cleanLogicalDirectory( lfn )
   if result['OK']:
     print 'OK'
   else:

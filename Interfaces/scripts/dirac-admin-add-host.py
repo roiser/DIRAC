@@ -33,10 +33,10 @@ def addProperty( arg ):
     hostProperties.append( arg )
 
 Script.setUsageMessage( '\n'.join( ['Add or Modify a Host info in DIRAC',
-                                    'Usage:',
-                                    '%s [option|cfgfile] ... Property=<Value> ...' % Script.scriptName,
-                                    'Arguments:',
-                                    ' Property=<Value>: Other properties to be added to the User like (Responsible=XXXX)', ] ) )
+                                    '\nUsage:\n',
+                                    '  %s [option|cfgfile] ... Property=<Value> ...' % Script.scriptName,
+                                    '\nArguments:\n',
+                                    '  Property=<Value>: Other properties to be added to the User like (Responsible=XXXX)', ] ) )
 
 Script.registerSwitch( 'H:', 'HostName:', 'Name of the Host (Mandatory)', setHostName )
 Script.registerSwitch( 'D:', 'HostDN:', 'DN of the Host Certificate (Mandatory)', setHostDN )
@@ -70,7 +70,7 @@ for prop in args:
     Script.gLogger.info( "Setting property %s to %s" % ( pName, pValue ) )
     hostProps[ pName ] = pValue
 
-if not diracAdmin.csModifyHost( hostName, hostProps, createIfNonExistant = True )['Value']:
+if not diracAdmin.csModifyHost( hostName, hostProps, createIfNonExistant = True )['OK']:
   errorList.append( ( "add host", "Cannot register host %s" % hostName ) )
   exitCode = 255
 else:

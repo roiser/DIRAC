@@ -1,3 +1,5 @@
+# TODO: to be removed
+
 ########################################################################
 # $HeadURL $
 # File: TransferTaskTests.py
@@ -13,6 +15,9 @@
     .. moduleauthor:: Krzysztof.Ciba@NOSPAMgmail.com
 
     test case for TransferTask
+
+    OBSOLETE
+    K.C.
 """
 
 __RCSID__ = "$Id $"
@@ -33,11 +38,11 @@ parseCommandLine()
 from DIRAC import S_OK, S_ERROR, gConfig, gLogger 
 from DIRAC.RequestManagementSystem.Client.RequestContainer import RequestContainer
 from DIRAC.DataManagementSystem.Client.DataLoggingClient import DataLoggingClient
-from DIRAC.DataManagementSystem.Client.ReplicaManager import ReplicaManager
+from DIRAC.DataManagementSystem.Client.DataManager import DataManager
 from DIRAC.RequestManagementSystem.Client.RequestClient import RequestClient
 ## tested code
 from DIRAC.DataManagementSystem.private.RequestTask import RequestTask
-from DIRAC.DataManagementSystem.Agent.TransferTask import TransferTask
+from DIRAC.DataManagementSystem.private.TransferTask import TransferTask
 
 #####################################################################################
 ## mock littel helpers
@@ -66,7 +71,7 @@ def getRequest( operation ):
                      "Arguments" : None,
                      "ExecutionOrder" : 0, 
                      "SourceSE" : None, 
-                     "TargetSE" : "CERN-USER,PIC-USER",
+                     "TargetSE" : "CERN-USER",
                      "Catalogue" : "LcgFileCatalogCombined", 
                      "CreationTime" : "2011-12-01 04:57:02", 
                      "SubmissionTime" : "2011-12-01 04:57:02",
@@ -103,25 +108,6 @@ class TransferTaskTests( unittest.TestCase ):
   .. class:: TransferTaskTests
 
   test case for TransferTask """
-
-  def test_01_put( self ):
-    """ 'put' operation """
-    kwargs = getKwargs( "put" )
-    tTask = TransferTask( **kwargs )
-    tTask.dataLoggingClient = Mock( return_value = Mock(spec = DataLoggingClient ) )
-    tTask.dataLoggingClient().addFileRecord = Mock()
-    tTask.dataLoggingClient().addFileRecord.return_value = SOK
-    tTask.requestClient = Mock( return_value = Mock(spec=RequestClient) ) 
-    tTask.requestClient().updateRequest = Mock()
-    tTask.requestClient().updateRequest.return_value = SOK
-    tTask.requestClient().finalizeRequest = Mock()
-    tTask.requestClient().finalizeRequest.return_value = SOK
-    tTask.replicaManager = Mock( return_value = Mock( spec=ReplicaManager) )
-    tTask.replicaManager().put = Mock()
-    tTask.replicaManager().put.return_value =  { "OK": True, "Value": { "Failed": {}, "Successful": { "/lhcb/user/c/cibak/11889/11889410/test.zzz": True } } }    
-    self.assertEqual( tTask.__call__(),
-                      {'OK': True, 'Value': {'monitor': {'Put': 1, 'Execute': 1, 'Done': 1, 'Put successful': 2}}} )
-    del tTask
              
   def test_02_putAndRegister( self ):
     """ 'putAndRegister' operation """
@@ -130,56 +116,32 @@ class TransferTaskTests( unittest.TestCase ):
     tTask.dataLoggingClient = Mock( return_value = Mock(spec = DataLoggingClient ) )
     tTask.dataLoggingClient().addFileRecord = Mock()
     tTask.dataLoggingClient().addFileRecord.return_value = SOK
-    tTask.requestClient = Mock( return_value = Mock(spec=RequestClient) ) 
+    tTask.requestClient = Mock( return_value = Mock( spec=RequestClient ) ) 
     tTask.requestClient().updateRequest = Mock()
     tTask.requestClient().updateRequest.return_value = SOK
+
+    tTask.requestClient().getRequestStatus = Mock()
+    tTask.requestClient().getRequestStatus.return_value = { "OK" : True, 
+                                                            "Value" : { "RequestStatus" : "Done", 
+                                                                        "SubRequestStatus" : "Done" }}
     tTask.requestClient().finalizeRequest = Mock()
     tTask.requestClient().finalizeRequest.return_value = SOK
-    tTask.replicaManager = Mock( return_value = Mock( spec=ReplicaManager) )
-    tTask.replicaManager().put = Mock()
-    tTask.replicaManager().putAndRegister.return_value =  { "OK": True, "Value": { "Failed": {}, "Successful": { "/lhcb/user/c/cibak/11889/11889410/test.zzz" : { "put": 1, "register": 1 } } } }
+
+
+    tTask.dataManager = Mock( return_value = Mock( spec = DataManager ) )
+    tTask.dm.put = Mock()
+    tTask.dm.putAndRegister.return_value = { "OK": True,
+                                                            "Value": { "Failed": {}, 
+                                                                       "Successful": { "/lhcb/user/c/cibak/11889/11889410/test.zzz" : 
+                                                                                       { "put": 1, "register": 1 } } } }
     self.assertEqual( tTask.__call__(),
-                      {'OK': True, 'Value': {'monitor': {'File registration successful': 2, 'Execute': 1, 'Done': 1, 'Put successful': 2, 'Put and register': 2}}} )
-    del tTask
-
-  def test_03_putAndRegisterAndRemove( self ):
-    """ 'putAndRegisterAndRemove' operation """
-    kwargs = getKwargs( "putAndRegisterAndRemove" )
-    tTask = TransferTask( **kwargs )
-    tTask.dataLoggingClient = Mock( return_value = Mock(spec = DataLoggingClient ) )
-    tTask.dataLoggingClient().addFileRecord = Mock()
-    tTask.dataLoggingClient().addFileRecord.return_value = SOK
-    tTask.requestClient = Mock( return_value = Mock(spec=RequestClient) ) 
-    tTask.requestClient().updateRequest = Mock()
-    tTask.requestClient().updateRequest.return_value = SOK
-    tTask.requestClient().finalizeRequest = Mock()
-    tTask.requestClient().finalizeRequest.return_value = SOK
-    tTask.replicaManager = Mock( return_value = Mock( spec=ReplicaManager) )
-    tTask.replicaManager().put = Mock()
-    tTask.replicaManager().putAndRegister.return_value =  { "OK": True, "Value": { "Failed": {}, "Successful": { "/lhcb/user/c/cibak/11889/11889410/test.zzz" : { "put": 1, "register": 1 } } } }
-    self.assertEqual( tTask.__call__(),
-                      {'OK': True, 'Value': {'monitor': {'File registration successful': 2, 'Execute': 1, 'Done': 1, 'Put successful': 2, 'Put and register': 2}}} )
-        
-    del tTask
-
-  def test_04_replicate( self ):
-    """ 'replicate' operation """
-    kwargs = getKwargs( "replicate" )
-    tTask = TransferTask( **kwargs )
-    tTask.dataLoggingClient = Mock( return_value = Mock(spec = DataLoggingClient ) )
-    tTask.dataLoggingClient().addFileRecord = Mock()
-    tTask.dataLoggingClient().addFileRecord.return_value = SOK
-    tTask.requestClient = Mock( return_value = Mock(spec=RequestClient) ) 
-    tTask.requestClient().updateRequest = Mock()
-    tTask.requestClient().updateRequest.return_value = SOK
-    tTask.requestClient().finalizeRequest = Mock()
-    tTask.requestClient().finalizeRequest.return_value = SOK
-    tTask.replicaManager = Mock( return_value = Mock( spec=ReplicaManager) )
-    tTask.replicaManager().replicate = Mock()
-    tTask.replicaManager().replicate.return_value =  { "OK": True, "Value": { "Failed": {}, "Successful": { "/lhcb/user/c/cibak/11889/11889410/test.zzz": True } } }
-    self.assertEqual( tTask(),
-                      {'OK': True, 'Value': {'monitor': {'Done': 1, 'Execute': 1, 'Replicate': 2, 'Replication successful': 2}}} )
-
+                      { 'OK': True, 
+                        'Value': { 'monitor': 
+                                   { 'File registration successful': 1, 
+                                     'Execute': 1, 
+                                     'Done': 1, 
+                                     'Put successful': 1, 
+                                     'Put and register': 1}}} )
     del tTask
 
   def test_05_replicateAndRegister( self ):
@@ -192,55 +154,30 @@ class TransferTaskTests( unittest.TestCase ):
     tTask.requestClient = Mock( return_value = Mock(spec=RequestClient) ) 
     tTask.requestClient().updateRequest = Mock()
     tTask.requestClient().updateRequest.return_value = SOK
+    tTask.requestClient().getRequestStatus = Mock()
+    tTask.requestClient().getRequestStatus.return_value = { "OK" : True, 
+                                                            "Value" : { "RequestStatus" : "Done", 
+                                                                        "SubRequestStatus" : "Done" }}
     tTask.requestClient().finalizeRequest = Mock()
     tTask.requestClient().finalizeRequest.return_value = SOK
-    tTask.replicaManager = Mock( return_value = Mock( spec=ReplicaManager) )
-    tTask.replicaManager().replicateAndRegister = Mock()
-    tTask.replicaManager().replicateAndRegister.return_value = { "OK": True, "Value": { "Failed": {}, "Successful": { "/lhcb/user/c/cibak/11889/11889410/test.zzz" : { "replicate": 1, "register": 1 } } } }
+    tTask.dataManager = Mock( return_value = Mock( spec = DataManager ) )
+    tTask.dm.replicateAndRegister = Mock()
+    tTask.dm.replicateAndRegister.return_value = { "OK": True,
+                                                                 "Value": { 
+        "Failed": {}, 
+        "Successful": { "/lhcb/user/c/cibak/11889/11889410/test.zzz" : { "replicate": 1, "register": 1 } } } }
+
     self.assertEqual( tTask(),
-                      {'OK': True, 'Value': {'monitor': {'Replica registration successful': 2, 'Execute': 1, 'Done': 1, 'Replication successful': 2, 'Replicate and register': 2}}} )
+                      { 'OK': True, 
+                        'Value': { 'monitor': 
+                                   { 'Replica registration successful': 1, 
+                                     'Execute': 1, 
+                                     'Done': 1, 
+                                     'Replication successful': 1, 
+                                     'Replicate and register': 1}}} )
                       
     del tTask
 
-  def test_06_replicateAndRegisterAndRemove( self ):
-    """ 'replicateAndRegisterAndRemove' operation """
-    kwargs = getKwargs( "replicateAndRegisterAndRemove" )
-    tTask = TransferTask( **kwargs )
-    tTask.dataLoggingClient = Mock( return_value = Mock(spec = DataLoggingClient ) )
-    tTask.dataLoggingClient().addFileRecord = Mock()
-    tTask.dataLoggingClient().addFileRecord.return_value = SOK
-    tTask.requestClient = Mock( return_value = Mock(spec=RequestClient) ) 
-    tTask.requestClient().updateRequest = Mock()
-    tTask.requestClient().updateRequest.return_value = SOK
-    tTask.requestClient().finalizeRequest = Mock()
-    tTask.requestClient().finalizeRequest.return_value = SOK
-    tTask.replicaManager = Mock( return_value = Mock( spec=ReplicaManager) )
-    tTask.replicaManager().replicateAndRegister = Mock()
-    tTask.replicaManager().replicateAndRegister.return_value =  { "OK" : True, "Value" : { "Failed" : {}, "Successful" : { "/lhcb/user/c/cibak/11889/11889410/test.zzz" : { "replicate" : 1, "register" : 1  } } } }
-    self.assertEqual( tTask(),
-                      {'OK': True, 'Value': {'monitor': {'Replica registration successful': 2, 'Execute': 1, 'Done': 1, 'Replication successful': 2, 'Replicate and register': 2}}} )
-
-    del tTask
-
-  def test_07_get( self ):
-    """ 'get' operation """
-    kwargs = getKwargs( "get" )
-    tTask = TransferTask( **kwargs )
-    tTask.dataLoggingClient = Mock( return_value = Mock(spec = DataLoggingClient ) )
-    tTask.dataLoggingClient().addFileRecord = Mock()
-    tTask.dataLoggingClient().addFileRecord.return_value = SOK
-    tTask.requestClient = Mock( return_value = Mock(spec=RequestClient) ) 
-    tTask.requestClient().updateRequest = Mock()
-    tTask.requestClient().updateRequest.return_value = SOK
-    tTask.requestClient().finalizeRequest = Mock()
-    tTask.requestClient().finalizeRequest.return_value = SOK
-    tTask.replicaManager = Mock( return_value = Mock( spec=ReplicaManager) )
-    tTask.replicaManager().getStorageFile = Mock()
-    tTask.replicaManager().getStorageFile.return_value =  { "OK" : True, "Value" : { "Failed" : {}, "Successful" : {  "srm://srm-lhcb.gridpp.rl.ac.uk/castor/ads.rl.ac.uk/prod/lhcb/user/c/cibak/11889/11889410/test.zzz" : True } } }
-    tTask.replicaManager().getFile = Mock()
-    tTask.replicaManager().getFile.return_value =  { "OK" : True, "Value" : { "Failed" : {}, "Successful" : { "/lhcb/user/c/cibak/11889/11889410/test.zzz" : True }}}
-    self.assertEqual( tTask(), {'OK': True, 'Value': {'monitor': {'Execute': 1, 'Done': 1}}} )
-    del tTask
 
 ### test execution
 if __name__ == "__main__":

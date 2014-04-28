@@ -16,6 +16,7 @@ import socket
 import imp
 import re
 import time
+import pickle
 
 #Check PYTHONPATH and LD_LIBARY_PATH
 try:
@@ -49,7 +50,6 @@ class CliParams:
     self.debug = False
     self.local = False
     self.dryRun = False
-    self.testVOMSOK = False
     self.site = ""
     self.ceName = ""
     self.queueName = ""
@@ -61,9 +61,15 @@ class CliParams:
     self.userDN = ""
     self.maxCycles = CliParams.MAX_CYCLES
     self.flavour = 'DIRAC'
-    self.gridVersion = '2010-11-20'
+    self.gridVersion = '2013-04-22'
     self.pilotReference = ''
     self.releaseVersion = ''
+    self.releaseProject = ''
+    # The following parameters are added for BOINC computing element with virtual machine.
+    self.boincUserID = ''         #  The user ID in a BOINC computing element
+    self.boincHostPlatform = ''   # The os type of the host machine running the pilot, not the virtual machine
+    self.boincHostID = ''         # the host id in a  BOINC computing element
+    self.boincHostName = ''       # the host name of the host machine running the pilot, not the virtual machine
 
 cliParams = CliParams()
 
@@ -104,6 +110,12 @@ def executeAndGetOutput( cmd ):
 # Version print
 
 logINFO( "Running %s" % " ".join( sys.argv ) )
+try:
+  fd = open( "%s.run" % sys.argv[0], "w" )
+  pickle.dump( sys.argv[1:], fd )
+  fd.close()
+except:
+  pass
 logINFO( "Version %s" % __RCSID__ )
 
 ###
@@ -118,43 +130,14 @@ except:
 pilotScriptName = os.path.basename( pilotScript )
 pilotRootPath = os.path.dirname( pilotScript )
 
-rootPath = os.getcwd()
-
 installScriptName = 'dirac-install.py'
-
-for path in ( pilotRootPath, rootPath ):
-  installScript = os.path.join( path, installScriptName )
-  if os.path.isfile( installScript ):
-    break
-
-if not os.path.isfile( installScript ):
-  logERROR( "%s requires %s to exist in one of: %s, %s" % ( pilotScriptName, installScriptName,
-                                                            pilotRootPath, rootPath ) )
-  logINFO( "Trying to download it to %s..." % rootPath )
-  try:
-    remoteLocation = "http://svnweb.cern.ch/guest/dirac/DIRAC/trunk/DIRAC/Core/scripts/dirac-install.py"
-    remoteLocation = "http://svnweb.cern.ch/guest/dirac/DIRAC/trunk/DIRAC/Core/scripts/dirac-install.py"
-    remoteFD = urllib2.urlopen( remoteLocation )
-    installScript = os.path.join( rootPath, installScriptName )
-    localFD = open( installScript, "w" )
-    localFD.write( remoteFD.read() )
-    localFD.close()
-    remoteFD.close()
-  except Exception, e:
-    logERROR( "Could not download %s..: %s" % ( remoteLocation, str( e ) ) )
-    sys.exit( 1 )
-
-os.chmod( installScript, stat.S_IRWXU )
+originalRootPath = os.getcwd()
+rootPath = os.getcwd()
 
 
 ###
 # Option parsing
 ###
-
-
-# Flags not migrated from old dirac-pilot
-#   -r --repository=<rep>       Use <rep> as cvs repository              <--Not done
-#   -C --cvs                    Retrieve from CVS (implies -b) <--Not done
 
 cmdOpts = ( ( 'b', 'build', 'Force local compilation' ),
             ( 'd', 'debug', 'Set debug flag' ),
@@ -171,6 +154,7 @@ cmdOpts = ( ( 'b', 'build', 'Force local compilation' ),
             ( 'D:', 'disk=', 'Require at least <space> MB available' ),
             ( 'M:', 'MaxCycles=', 'Maximum Number of JobAgent cycles to run' ),
             ( 'N:', 'Name=', 'Use <CEName> to determine Site Name' ),
+            ( 'Q:', 'queue=', 'Queue name' ),
             ( 'P:', 'path=', 'Install under <path>' ),
             ( 'E', 'server', 'Make a full server installation' ),
             ( 'S:', 'setup=', 'DIRAC Setup to use' ),
@@ -185,10 +169,12 @@ cmdOpts = ( ( 'b', 'build', 'Force local compilation' ),
             ( 'o:', 'option=', 'Option=value to add' ),
             ( 'c', 'cert', 'Use server certificate instead of proxy' ),
             ( 'R:', 'reference=', 'Use this pilot reference' ),
+            ( 'x:', 'execute=', 'Execute instead of JobAgent' ),
           )
 
 installOpts = []
 configureOpts = []
+executeCmd = False
 
 optList, args = getopt.getopt( sys.argv[1:],
                                "".join( [ opt[0] for opt in cmdOpts ] ),
@@ -199,6 +185,8 @@ for o, v in optList:
     for cmdOpt in cmdOpts:
       print "%s %s : %s" % ( cmdOpt[0].ljust( 4 ), cmdOpt[1].ljust( 20 ), cmdOpt[2] )
     sys.exit( 1 )
+  elif o in ( '-x', '--execute' ):
+    executeCmd = v
   elif o in ( '-b', '--build' ):
     installOpts.append( '-b' )
   elif o == '-d' or o == '--debug':
@@ -212,6 +200,7 @@ for o, v in optList:
     cliParams.pythonVersion = v
   elif o in ( '-l', '--project' ):
     installOpts.append( "-l '%s'" % v )
+    cliParams.releaseProject = v
   elif o == '-n' or o == '--name':
     configureOpts.append( '-n "%s"' % v )
     cliParams.site = v
@@ -228,6 +217,8 @@ for o, v in optList:
   elif o == '-N' or o == '--Name':
     configureOpts.append( '-N "%s"' % v )
     cliParams.ceName = v
+  elif o == '-Q' or o == '--queue':
+    cliParams.queueName = v  
   elif o == '-D' or o == '--disk':
     try:
       cliParams.minDiskSpace = int( v )
@@ -270,12 +261,43 @@ for o, v in optList:
   elif o == '-c' or o == '--cert':
     configureOpts.append( '--UseServerCertificate' )
 
+############################################################################
+# Locate installation script
+for path in ( pilotRootPath, originalRootPath, rootPath ):
+  installScript = os.path.join( path, installScriptName )
+  if os.path.isfile( installScript ):
+    break
+
+if not os.path.isfile( installScript ):
+  logERROR( "%s requires %s to exist in one of: %s, %s, %s" % ( pilotScriptName, installScriptName,
+                                                            pilotRootPath, originalRootPath, rootPath ) )
+  logINFO( "Trying to download it to %s..." % originalRootPath )
+  try:
+    remoteLocation = "http://lhcbproject.web.cern.ch/lhcbproject/dist/Dirac_project/dirac-install.py"
+    remoteFD = urllib2.urlopen( remoteLocation )
+    installScript = os.path.join( originalRootPath, installScriptName )
+    localFD = open( installScript, "w" )
+    localFD.write( remoteFD.read() )
+    localFD.close()
+    remoteFD.close()
+  except Exception, e:
+    logERROR( "Could not download %s..: %s" % ( remoteLocation, str( e ) ) )
+    sys.exit( 1 )
+
+try:
+  os.chmod( installScript, stat.S_IRWXU )
+except:
+  pass
+
+######################################################################
+
 if cliParams.gridVersion:
   installOpts.append( "-g '%s'" % cliParams.gridVersion )
 
 if cliParams.pythonVersion:
   installOpts.append( '-i "%s"' % cliParams.pythonVersion )
-##
+
+######################################################################
 # Attempt to determine the flavour
 ##
 
@@ -286,13 +308,28 @@ if cliParams.pilotReference:
   cliParams.flavour = 'DIRAC'
   pilotRef = cliParams.pilotReference
 
-# Take the reference from the Torque batch system  
+# Take the reference from the Torque batch system
 if os.environ.has_key( 'PBS_JOBID' ):
-  cliParams.flavour = 'DIRAC'
-  pilotRef = os.environ['PBS_JOBID']
+  cliParams.flavour = 'SSHTorque'
+  pilotRef = 'sshtorque://'+cliParams.ceName+'/'+os.environ['PBS_JOBID']
   cliParams.queueName = os.environ['PBS_QUEUE']
 
-# This is the CREAM direct submission case  
+# Grid Engine
+if os.environ.has_key( 'JOB_ID' ):
+    cliParams.flavour = 'SSHGE'
+    pilotRef = 'sshge://'+cliParams.ceName+'/'+os.environ['JOB_ID']
+
+# Condor
+if os.environ.has_key( 'CONDOR_JOBID' ):
+  cliParams.flavour = 'SSHCondor'
+  pilotRef = 'sshcondor://'+cliParams.ceName+'/'+os.environ['CONDOR_JOBID']
+
+# LSF
+if os.environ.has_key( 'LSB_BATCH_JID' ):
+  cliParams.flavour = 'SSHLSF'
+  pilotRef = 'sshlsf://'+cliParams.ceName+'/'+os.environ['LSB_BATCH_JID']
+
+# This is the CREAM direct submission case
 if os.environ.has_key( 'CREAM_JOBID' ):
   cliParams.flavour = 'CREAM'
   pilotRef = os.environ['CREAM_JOBID']
@@ -307,20 +344,56 @@ if os.environ.has_key( 'GLITE_WMS_JOBID' ):
   if os.environ['GLITE_WMS_JOBID'] != 'N/A':
     cliParams.flavour = 'gLite'
     pilotRef = os.environ['GLITE_WMS_JOBID']
-    
-if os.environ.has_key( 'JOB_ID' ):
-    cliParams.flavour = 'SSHGE'
-    pilotRef = os.environ['JOB_ID']
+
+if os.environ.has_key( 'OSG_WN_TMP' ):
+  cliParams.flavour = 'OSG'
+
+# Direct SSH tunnel submission
+if os.environ.has_key( 'SSHCE_JOBID' ):
+  cliParams.flavour = 'SSH'
+  pilotRef = 'ssh://'+cliParams.ceName+'/'+os.environ['SSHCE_JOBID']  
+  
+# ARC case  
+if os.environ.has_key( 'GRID_GLOBAL_JOBID' ):
+  cliParams.flavour = 'ARC'
+  pilotRef = os.environ['GRID_GLOBAL_JOBID']     
+
+# This is for BOINC case
+if os.environ.has_key( 'BOINC_JOB_ID' ):
+  cliParams.flavour = 'BOINC'
+  pilotRef = os.environ['BOINC_JOB_ID']
+
+if cliParams.flavour == 'BOINC':
+  if os.environ.has_key('BOINC_USER_ID'):
+    cliParams.boincUserID = os.environ['BOINC_USER_ID']
+  if os.environ.has_key('BOINC_HOST_ID'):
+    cliParams.boincHostID = os.environ['BOINC_HOST_ID']
+  if os.environ.has_key('BOINC_HOST_PLATFORM'):
+    cliParams.boincHostPlatform = os.environ['BOINC_HOST_PLATFORM']
+  if os.environ.has_key('BOINC_HOST_NAME'):
+    cliParams.boincHostName = os.environ['BOINC_HOST_NAME']
+
+logDEBUG( "Flavour: %s; pilot reference: %s " % ( cliParams.flavour, pilotRef ) )
 
 configureOpts.append( '-o /LocalSite/GridMiddleware=%s' % cliParams.flavour )
 if pilotRef != 'Unknown':
   configureOpts.append( '-o /LocalSite/PilotReference=%s' % pilotRef )
 
+# add options for BOINc
+if cliParams.boincUserID:
+  configureOpts.append( '-o /LocalSite/BoincUserID=%s' % cliParams.boincUserID )
+if cliParams.boincHostID:
+  configureOpts.append( '-o /LocalSite/BoincHostID=%s' % cliParams.boincHostID)
+if cliParams.boincHostPlatform:
+  configureOpts.append( '-o /LocalSite/BoincHostPlatform=%s' % cliParams.boincHostPlatform)
+if cliParams.boincHostName:
+  configureOpts.append( '-o /LocalSite/BoincHostName=%s' % cliParams.boincHostName )
+
 ###
 # Try to get the CE name
 ###
 #cliParams.ceName = 'Local'
-if cliParams.flavour == 'LCG' or cliParams.flavour == 'gLite' :
+if cliParams.flavour in ['LCG','gLite','OSG']:
   retCode, CE = executeAndGetOutput( 'glite-brokerinfo getCE || edg-brokerinfo getCE' )
   if not retCode:
     cliParams.ceName = CE.split( ':' )[0]
@@ -328,7 +401,7 @@ if cliParams.flavour == 'LCG' or cliParams.flavour == 'gLite' :
       cliParams.queueName = CE.split( '/' )[1]
     configureOpts.append( '-N "%s"' % cliParams.ceName )
   elif os.environ.has_key( 'OSG_JOB_CONTACT' ):
-    # OSG_JOB_CONTACT String specifying the endpoint to use within the job submission 
+    # OSG_JOB_CONTACT String specifying the endpoint to use within the job submission
     #                 for reaching the site (e.g. manager.mycluster.edu/jobmanager-pbs )
     CE = os.environ['OSG_JOB_CONTACT']
     cliParams.ceName = CE.split( '/' )[0]
@@ -352,6 +425,8 @@ if cliParams.ceName:
   configureOpts.append( '-o /LocalSite/GridCE=%s' % cliParams.ceName )
 if cliParams.releaseVersion:
   configureOpts.append( '-o /LocalSite/ReleaseVersion=%s' % cliParams.releaseVersion )
+if cliParams.releaseProject:
+  configureOpts.append( '-o /LocalSite/ReleaseProject=%s' % cliParams.releaseProject )
 
 ###
 # Set the platform if defined
@@ -369,6 +444,42 @@ if cliParams.userGroup:
 
 if cliParams.userDN:
   configureOpts.append( '-o /AgentJobRequirements/OwnerDN="%s"' % cliParams.userDN )
+
+#############################################################################
+# Treat the OSG case
+
+osgDir = ''
+if cliParams.flavour == "OSG":
+  vo = cliParams.releaseProject.replace( 'DIRAC', '' ).upper()
+  if not vo:
+    vo = 'DIRAC'
+  osgDir = os.environ['OSG_WN_TMP']
+  # Make a separate directory per Project if it is defined
+  jobDir = os.path.basename( pilotRef )
+  if not jobDir:   # just in case
+    import random
+    jobDir = str( random.randint( 1000, 10000 ) )
+  osgDir = os.path.join( osgDir, vo, jobDir )
+  if not os.path.isdir(osgDir):
+    os.makedirs(osgDir)
+  os.chdir( osgDir )
+  try:
+    import shutil
+    shutil.copy( installScript, os.path.join( osgDir, installScriptName ) )
+  except Exception, x:
+    print sys.executable
+    print sys.version
+    print os.uname()
+    print x
+    raise x
+
+if os.environ.has_key( 'OSG_APP' ):
+  # Try to define it here although this will be only in the local shell environment
+  os.environ['VO_%s_SW_DIR' % vo] = os.path.join( os.environ['OSG_APP'], vo )
+
+if rootPath == originalRootPath:
+  # No special root path was requested
+  rootPath = os.getcwd()
 
 ###
 # Do the installation
@@ -395,6 +506,8 @@ sys.path.insert( 0, diracScriptsPath )
 
 # Instead of dumping the Full configuration, include all Server in dirac.cfg
 configureOpts.append( '-I' )
+if cliParams.debug:
+  configureOpts.append( '-d' )
 configureCmd = "%s %s" % ( os.path.join( diracScriptsPath, "dirac-configure" ), " ".join( configureOpts ) )
 
 logDEBUG( "Configuring DIRAC with: %s" % configureCmd )
@@ -423,10 +536,6 @@ if not cliParams.platform:
   platFD.close()
   cliParams.platform = PlatformModule.getPlatformString()
 
-if cliParams.testVOMSOK:
-  # Check voms-proxy-info before touching the original PATH and LD_LIBRARY_PATH
-  os.system( 'which voms-proxy-info && voms-proxy-info -all' )
-
 diracLibPath = os.path.join( rootPath, cliParams.platform, 'lib' )
 diracBinPath = os.path.join( rootPath, cliParams.platform, 'bin' )
 for envVarName in ( 'LD_LIBRARY_PATH', 'PYTHONPATH' ):
@@ -441,17 +550,6 @@ os.environ['PATH'] = '%s:%s:%s' % ( diracBinPath, diracScriptsPath, os.getenv( '
 ###
 # End of initialisation
 ###
-
-#
-# Check proxy
-#
-
-ret = os.system( 'dirac-proxy-info' )
-if cliParams.testVOMSOK:
-  ret = os.system( 'dirac-proxy-info | grep -q fqan' )
-  if ret != 0:
-    os.system( 'dirac-proxy-info 2>&1 | mail -s "dirac-pilot: missing voms certs at %s" dirac.alarms@gmail.com' % cliParams.site )
-    sys.exit( -1 )
 
 #
 # Set the local architecture
@@ -472,13 +570,11 @@ if architectureScript:
   retCode, localArchitecture = executeAndGetOutput( architectureScript )
   if not retCode:
     localArchitecture = localArchitecture.strip()
-    os.environ['CMTCONFIG'] = localArchitecture
-    logINFO( 'Setting CMTCONFIG=%s' % localArchitecture )
     # os.system( "%s -f %s -o '/LocalSite/Architecture=%s'" % ( cacheScript, cfgFile, localArchitecture ) )
     # dirac-configure will not change existing cfg unless -U option is used.
     os.system( "%s -F -o '/LocalSite/Architecture=%s'" % ( configureScript, localArchitecture ) )
   else:
-    logERROR( "There was an error calling %s" % architectureScript )
+    logERROR( "There was an error calling %s: %s" % ( architectureScript, localArchitecture ) )
 #
 # Get host and local user info
 #
@@ -567,7 +663,7 @@ if diskSpace < cliParams.minDiskSpace:
 # Get job CPU requirement and queue normalization
 #
 
-if cliParams.flavour == 'LCG' or cliParams.flavour == 'gLite' :
+if cliParams.flavour in ['LCG','gLite','OSG']:
   logINFO( 'CE = %s' % CE )
   logINFO( 'LCG_SITE_CE = %s' % cliParams.ceName )
 
@@ -590,6 +686,7 @@ if cliParams.flavour == 'LCG' or cliParams.flavour == 'gLite' :
   else:
     logERROR( "There was an error calling dirac-wms-get-queue-normalization" )
 
+
   retCode, queueLength = executeAndGetOutput( 'dirac-wms-get-normalized-queue-length %s' % CE )
   if not retCode:
     queueLength = queueLength.strip().split( ' ' )
@@ -601,6 +698,9 @@ if cliParams.flavour == 'LCG' or cliParams.flavour == 'gLite' :
   else:
     logERROR( "There was an error calling dirac-wms-get-normalized-queue-length" )
 
+# Instead of using the Average reported by the Site, determine a Normalization
+#os.system( "dirac-wms-cpu-normalization -U" )
+
 #
 # further local configuration
 #
@@ -608,7 +708,7 @@ if cliParams.flavour == 'LCG' or cliParams.flavour == 'gLite' :
 inProcessOpts = ['-s /Resources/Computing/CEDefaults' ]
 inProcessOpts .append( '-o WorkingDirectory=%s' % rootPath )
 inProcessOpts .append( '-o GridCE=%s' % cliParams.ceName )
-if cliParams.flavour == 'LCG' or cliParams.flavour == 'gLite' :
+if cliParams.flavour in ['LCG','gLite','OSG']:
   inProcessOpts .append( '-o GridCEQueue=%s' % CE )
 inProcessOpts .append( '-o LocalAccountString=%s' % localUser )
 inProcessOpts .append( '-o TotalCPUs=%s' % 1 )
@@ -639,12 +739,15 @@ for i in os.listdir( rootPath ):
   if os.path.isfile( cfg ) and re.search( '.cfg&', cfg ):
     extraCFG.append( cfg )
 
+if executeCmd:
+  #Execute user command
+  logINFO( "Executing user defined command: %s" % executeCmd )
+  sys.exit( os.system( "source bashrc; %s" % executeCmd ) / 256 )
+
 #
 # Start the job agent
 #
-
 logINFO( 'Starting JobAgent' )
-
 os.environ['PYTHONUNBUFFERED'] = 'yes'
 
 diracAgentScript = os.path.join( rootPath, "scripts", "dirac-agent" )
@@ -673,5 +776,10 @@ diskSpace = fs[4] * fs[0] / 1024 / 1024
 logINFO( 'DiskSpace (MB) = %s' % diskSpace )
 ret = os.system( 'dirac-proxy-info' )
 
+# Do some cleanup
+if os.environ.has_key( 'OSG_WN_TMP' ) and osgDir:
+  os.chdir( originalRootPath )
+  import shutil
+  shutil.rmtree( osgDir )
 
 sys.exit( 0 )

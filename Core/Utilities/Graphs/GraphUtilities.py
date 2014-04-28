@@ -26,7 +26,11 @@ def evalPrefs( *args, **kw ):
   for pDict in list( args ) + [kw]:
     if type( pDict ) == types.DictType:
       for key in pDict:
-        prefs[key] = pDict[key]
+        if key == "metadata":
+          for mkey in pDict[key]:
+            prefs[mkey] = pDict[key][mkey]
+        else:    
+          prefs[key] = pDict[key]
 
   return prefs
 
@@ -407,7 +411,6 @@ def makeDataFromCSV( csv ):
 
   graph_data = {}
   labels = flines[0].strip().split( ',' )
-
   if len( labels ) == 2:
     # simple plot data
     for line in flines:
@@ -416,11 +419,16 @@ def makeDataFromCSV( csv ):
         key, value = line.split( ',' )
         graph_data[key] = value
 
+  elif len( flines ) == 2:
+    values = flines[1].strip().split( ',' )
+    for key,value in zip(labels,values):
+      graph_data[key] = value
+
   elif len( labels ) > 2:
     # stacked graph data
     del labels[0]
     del flines[0]
-    for label in labels:
+    for label in labels:      
       plot_data = {}
       index = labels.index( label ) + 1
       for line in flines:
@@ -434,3 +442,20 @@ def makeDataFromCSV( csv ):
       graph_data[label] = dict( plot_data )
 
   return graph_data
+
+def darkenColor( color, factor=2 ):
+  
+  c1 = int( color[1:3], 16 )
+  c2 = int( color[3:5], 16 )
+  c3 = int( color[5:7], 16 )
+  
+  c1 /= factor
+  c2 /= factor
+  c3 /= factor
+  
+  result = '#' + (str( hex( c1) ).replace( '0x', '' ).zfill( 2 ) + 
+                  str( hex( c2) ).replace( '0x', '' ).zfill( 2 ) + 
+                  str( hex( c3) ).replace( '0x', '' ).zfill( 2 ) )
+  return result
+  
+  

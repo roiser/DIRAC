@@ -10,16 +10,12 @@
 __RCSID__ = "$Id$"
 
 from DIRAC.Resources.Computing.ComputingElement          import ComputingElement
-from DIRAC.Core.Utilities.Subprocess                     import shellCall
 from DIRAC.Core.Utilities.Grid                           import executeGridCommand
 from DIRAC.Core.Utilities.File                           import makeGuid
 from DIRAC                                               import S_OK, S_ERROR
-from DIRAC                                               import systemCall, rootPath
-from DIRAC                                               import gConfig
-from DIRAC.Core.Security.ProxyInfo                       import getProxyInfo
 
-import os, sys, time, re, socket, stat, shutil
-import string, shutil, tempfile
+import os, re, tempfile
+from types import StringTypes
 
 CE_NAME = 'CREAM'
 MANDATORY_PARAMETERS = [ 'Queue' ]
@@ -36,6 +32,10 @@ class CREAMComputingElement( ComputingElement ):
     self.submittedJobs = 0
     self.mandatoryParameters = MANDATORY_PARAMETERS
     self.pilotProxy = ''
+    self.queue = ''
+    self.outputURL = 'gsiftp://localhost'
+    self.gridEnv = ''
+    self.proxyRenewal = 0
 
   #############################################################################
   def _addCEConfigDefaults( self ):
@@ -67,8 +67,6 @@ class CREAMComputingElement( ComputingElement ):
             'executableFile':executableFile,
             'executable':os.path.basename( executableFile ),
             'outputURL':self.outputURL,
-            'ceName':self.ceName,
-            'queueName':self.queue,
             'diracStamp':diracStamp
            }
 
@@ -76,7 +74,7 @@ class CREAMComputingElement( ComputingElement ):
     jdlFile.close()
     return name, diracStamp
 
-  def reset( self ):
+  def _reset( self ):
     self.queue = self.ceParameters['Queue']
     self.outputURL = self.ceParameters.get( 'OutputURL', 'gsiftp://localhost' )
     self.gridEnv = self.ceParameters['GridEnv']
@@ -98,52 +96,67 @@ class CREAMComputingElement( ComputingElement ):
              '%s/%s' % ( self.ceName, self.queue ),
              '%s' % jdlName ]
       result = executeGridCommand( self.proxy, cmd, self.gridEnv )
-
+      os.unlink( jdlName )
       if result['OK']:
         if result['Value'][0]:
           # We have got a non-zero status code
-          return S_ERROR('Pilot submission failed with error: %s ' % result['Value'][2].strip())
+          return S_ERROR( 'Pilot submission failed with error: %s ' % result['Value'][2].strip() )
         pilotJobReference = result['Value'][1].strip()
         if not pilotJobReference:
-          return S_ERROR('No pilot reference returned from the glite job submission command')
+          return S_ERROR( 'No pilot reference returned from the glite job submission command' )
+        if not pilotJobReference.startswith( 'https' ):
+          return S_ERROR( 'Invalid pilot reference %s' % pilotJobReference )
         batchIDList.append( pilotJobReference )
         stampDict[pilotJobReference] = diracStamp
-      os.unlink( jdlName )
     else:
       delegationID = makeGuid()
       cmd = [ 'glite-ce-delegate-proxy', '-e', '%s' % self.ceName, '%s' % delegationID ]
       result = executeGridCommand( self.proxy, cmd, self.gridEnv )
       if not result['OK']:
-        self.log.error('Failed to delegate proxy: %s' % result['Message'])
+        self.log.error( 'Failed to delegate proxy: %s' % result['Message'] )
         return result
-      for i in range( numberOfJobs ):
+      for _i in range( numberOfJobs ):
         jdlName, diracStamp = self.__writeJDL( executableFile )
         cmd = ['glite-ce-job-submit', '-n', '-N', '-r',
                '%s/%s' % ( self.ceName, self.queue ),
                '-D', '%s' % delegationID, '%s' % jdlName ]
         result = executeGridCommand( self.proxy, cmd, self.gridEnv )
+        os.unlink( jdlName )
         if not result['OK']:
           break
         if result['Value'][0] != 0:
           break
         pilotJobReference = result['Value'][1].strip()
-        if pilotJobReference:
+        if pilotJobReference and pilotJobReference.startswith( 'https' ):
           batchIDList.append( pilotJobReference )
           stampDict[pilotJobReference] = diracStamp
         else:
-          break  
-        os.unlink( jdlName )
-
-    os.unlink( executableFile )
+          break
     if batchIDList:
       result = S_OK( batchIDList )
       result['PilotStampDict'] = stampDict
     else:
-      result = S_ERROR('No pilot references obtained from the glite job submission')  
+      result = S_ERROR( 'No pilot references obtained from the glite job submission' )
     return result
 
+  def killJob( self, jobIDList ):
+    """ Kill the specified jobs
+    """
+    jobList = list( jobIDList )
+    if type( jobIDList ) in StringTypes:
+      jobList = [ jobIDList ]
+
+    cmd = ['glite-ce-job-cancel', '-n', '-N'] + jobList
+    result = executeGridCommand( self.proxy, cmd, self.gridEnv )
+    if not result['OK']:
+      return result
+    if result['Value'][0] != 0:
+      return S_ERROR( 'Failed kill job: %s' % result['Value'][0][1] )
+
+    return S_OK()
+
 #############################################################################
-  def getDynamicInfo( self ):
+  def getCEStatus( self ):
     """ Method to return information on running and pending jobs.
     """
     statusList = ['REGISTERED', 'PENDING', 'IDLE', 'RUNNING', 'REALLY-RUNNING']
@@ -155,10 +168,24 @@ class CREAMComputingElement( ComputingElement ):
     if not result['OK']:
       return result
     if result['Value'][0]:
-      if result['Value'][2]:
-        return S_ERROR(result['Value'][2])
+      if result['Value'][0] == 11:
+        return S_ERROR( 'Segmentation fault while calling glite-ce-job-status' )
+      elif result['Value'][2]:
+        return S_ERROR( result['Value'][2] )
+      elif "Authorization error" in result['Value'][1]:
+        return S_ERROR( "Authorization error" )
+      elif "FaultString" in result['Value'][1]:
+        res = re.search( 'FaultString=\[([\w\s]+)\]', result['Value'][1] )
+        fault = ''
+        if res:
+          fault = res.group( 1 )
+        detail = ''
+        res = re.search( 'FaultDetail=\[([\w\s]+)\]', result['Value'][1] )  
+        if res:
+          detail = res.group( 1 )
+          return S_ERROR( "Error: %s:%s" % (fault,detail) )
       else:
-        return S_ERROR('Error while interrogating CE status')
+        return S_ERROR( 'Error while interrogating CE status' )
     if result['Value'][1]:
       resultDict = self.__parseJobStatus( result['Value'][1] )
 
@@ -179,13 +206,36 @@ class CREAMComputingElement( ComputingElement ):
   def getJobStatus( self, jobIDList ):
     """ Get the status information for the given list of jobs
     """
+    if self.proxyRenewal % 60 == 0:
+      self.proxyRenewal += 1
+      statusList = ['REGISTERED', 'PENDING', 'IDLE', 'RUNNING', 'REALLY-RUNNING']
+      cmd = ['glite-ce-job-status', '-L', '2', '--all', '-e',
+             '%s' % self.ceName, '-s',
+             '%s' % ':'.join( statusList ) ]
+      result = executeGridCommand( self.proxy, cmd, self.gridEnv )
+      if result['OK']:
+        delegationIDs = []
+        for line in result['Value'][1].split( '\n' ):
+          if line.find( 'Deleg Proxy ID' ) != -1:
+            delegationID = line.split()[-1].replace( '[', '' ).replace( ']', '' )
+            if delegationID not in delegationIDs:
+              delegationIDs.append( delegationID )
+        if delegationIDs:
+          cmd = ['glite-ce-proxy-renew', '-e', self.ceName ]
+          cmd.extend( delegationIDs )
+          self.log.info( 'Refreshing proxy for:', ' '.join( delegationIDs ) )
+          result = executeGridCommand( self.proxy, cmd, self.gridEnv )
 
     workingDirectory = self.ceParameters['WorkingDirectory']
     fd, idFileName = tempfile.mkstemp( suffix = '.ids', prefix = 'CREAM_', dir = workingDirectory )
     idFile = os.fdopen( fd, 'w' )
     idFile.write( '##CREAMJOBS##' )
-    for id in jobIDList:
-      idFile.write( '\n' + id )
+    for id_ in jobIDList:
+      if ":::" in id_:
+        ref, stamp = id_.split( ':::' )
+      else:
+        ref = id_
+      idFile.write( '\n' + ref )
     idFile.close()
 
     cmd = ['glite-ce-job-status', '-n', '-i', '%s' % idFileName ]
@@ -193,18 +243,18 @@ class CREAMComputingElement( ComputingElement ):
     os.unlink( idFileName )
     resultDict = {}
     if not result['OK']:
-      self.log.error('Failed to get job status',result['Message'])
+      self.log.error( 'Failed to get job status', result['Message'] )
       return result
     if result['Value'][0]:
       if result['Value'][2]:
-        return S_ERROR(result['Value'][2])
+        return S_ERROR( result['Value'][2] )
       else:
-        return S_ERROR('Error while interrogating job statuses')
+        return S_ERROR( 'Error while interrogating job statuses' )
     if result['Value'][1]:
       resultDict = self.__parseJobStatus( result['Value'][1] )
-     
+
     if not resultDict:
-      return  S_ERROR('No job statuses returned')
+      return  S_ERROR( 'No job statuses returned' )
 
     # If CE does not know about a job, set the status to Unknown
     for job in jobIDList:
@@ -219,33 +269,32 @@ class CREAMComputingElement( ComputingElement ):
     resultDict = {}
     ref = ''
     for line in output.split( '\n' ):
-      if not line: continue
+      if not line:
+        continue
       match = re.search( 'JobID=\[(.*)\]', line )
       if match and len( match.groups() ) == 1:
         ref = match.group( 1 )
       match = re.search( 'Status.*\[(.*)\]', line )
       if match and len( match.groups() ) == 1:
-         creamStatus = match.group( 1 )
-         if creamStatus in ['DONE-OK']:
-           resultDict[ref] = 'Done'
-         elif creamStatus in ['DONE-FAILED']:
-           resultDict[ref] = 'Failed'
-         elif creamStatus in ['REGISTERED', 'PENDING', 'IDLE']:
-           resultDict[ref] = 'Scheduled'
-         elif creamStatus in ['ABORTED']:
-           resultDict[ref] = 'Aborted'
-         elif creamStatus in ['CANCELLED']:
-           resultDict[ref] = 'Killed'
-         elif creamStatus in ['RUNNING', 'REALLY-RUNNING']:
-           resultDict[ref] = 'Running'
-         elif creamStatus == 'N/A':
-           resultDict[ref] = 'Unknown'
-         else:
-           resultDict[ref] = creamStatus.capitalize()
-
+        creamStatus = match.group( 1 )
+        if creamStatus in ['DONE-OK']:
+          resultDict[ref] = 'Done'
+        elif creamStatus in ['DONE-FAILED']:
+          resultDict[ref] = 'Failed'
+        elif creamStatus in ['REGISTERED', 'PENDING', 'IDLE']:
+          resultDict[ref] = 'Scheduled'
+        elif creamStatus in ['ABORTED']:
+          resultDict[ref] = 'Aborted'
+        elif creamStatus in ['CANCELLED']:
+          resultDict[ref] = 'Killed'
+        elif creamStatus in ['RUNNING', 'REALLY-RUNNING']:
+          resultDict[ref] = 'Running'
+        elif creamStatus == 'N/A':
+          resultDict[ref] = 'Unknown'
+        else:
+          resultDict[ref] = creamStatus.capitalize()
 
     return resultDict
-
 
   def getJobOutput( self, jobID, localDir = None ):
     """ Get the specified job standard output and error files. If the localDir is provided,
@@ -282,6 +331,13 @@ class CREAMComputingElement( ComputingElement ):
         output = outFile.read()
         outFile.close()
         os.unlink( outFileName )
+      elif result['Value'][0] == 1 and "No such file or directory" in result['Value'][2]:
+        output = "Standard Output is not available on the CREAM service"
+        if os.path.exists( outFileName ):
+          os.unlink( outFileName )
+      else:
+        error = '\n'.join( result['Value'][1:] )
+        return S_ERROR( error )
     else:
       return S_ERROR( 'Failed to retrieve output for %s' % jobID )
 
@@ -294,6 +350,10 @@ class CREAMComputingElement( ComputingElement ):
         error = errFile.read()
         errFile.close()
         os.unlink( errFileName )
+    elif result['Value'][0] == 1 and "No such file or directory" in result['Value'][2]:
+        error = "Standard Error is not available on the CREAM service"
+        if os.path.exists( errFileName ):
+          os.unlink( errFileName )
     else:
       return S_ERROR( 'Failed to retrieve error for %s' % jobID )
 

@@ -1,10 +1,14 @@
+""" Transformation Database Client Command Line Interface.
+"""
+
+__RCSID__ = '$Id:  $'
+
 #! /usr/bin/env python
 from DIRAC.Core.Base.Script import parseCommandLine
 parseCommandLine()
 
-""" Transformation Database Client Command Line Interface. """
+import sys, cmd
 
-from DIRAC                                                      import gConfig, gLogger, S_OK, S_ERROR
 from DIRAC.Core.Base.API                                        import API
 from DIRAC.Core.Utilities.List                                  import sortList
 from DIRAC.Core.Utilities.Subprocess                            import shellCall
@@ -12,7 +16,7 @@ from DIRAC.Core.Utilities.Subprocess                            import shellCall
 from DIRAC.TransformationSystem.Client.Transformation           import Transformation
 from DIRAC.TransformationSystem.Client.TransformationClient     import TransformationClient
 
-import re, time, types, string, signal, sys, os, cmd
+__RCSID__ = "$Id$"
 
 def printDict( dictionary ):
   """ Dictionary pretty printing """
@@ -55,7 +59,7 @@ class TransformationCLI( cmd.Cmd, API ):
   def do_help( self, args ):
     """ Default version of the help command
        Usage: help <command>
-       OR use helpall to see description for all commans"""
+       OR use helpall to see description for all commands"""
     cmd.Cmd.do_help( self, args )
 
   # overriting default help command
@@ -90,14 +94,14 @@ class TransformationCLI( cmd.Cmd, API ):
     comm = args
     res = shellCall( 0, comm )
     if res['OK'] and res['Value'][0] == 0:
-      returnCode, stdOut, stdErr = res['Value']
+      _returnCode, stdOut, stdErr = res['Value']
       print "%s\n%s" % ( stdOut, stdErr )
     else:
       print res['Message']
 
   def check_params( self, args, num ):
     """Checks if the number of parameters correct"""
-    argss = string.split( args )
+    argss = args.split()
     length = len( argss )
     if length < num:
       print "Error: Number of arguments provided %d less that required %d, please correct." % ( length, num )
@@ -110,17 +114,6 @@ class TransformationCLI( cmd.Cmd, API ):
       return long( id_or_name ) # its look like id
     return id_or_name
 
-  def do_setServer( self, args ):
-    """ Set the destination server
-
-        usage: setServer serverURL
-    """
-    argss = string.split( args )
-    if len( argss ) == 0:
-      print "no server provided"
-    self.serverURL = argss[0]
-    self.server.setServer( self.serverURL )
-
   ####################################################################
   #
   # These are the methods for transformation manipulation
@@ -132,15 +125,14 @@ class TransformationCLI( cmd.Cmd, API ):
        usage: getall [Status] [Status]
     """
     oTrans = Transformation()
-    oTrans.setServer( self.serverURL )
-    oTrans.getTransformations( transStatus = string.split( args ), printOutput = True )
+    oTrans.getTransformations( transStatus = args.split(), printOutput = True )
 
   def do_getStatus( self, args ):
     """Get transformation details
 
        usage: getStatus <transName|ID>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no transformation supplied"
       return
@@ -157,7 +149,7 @@ class TransformationCLI( cmd.Cmd, API ):
        usage: setStatus  <Status> <transName|ID>
        Status <'New' 'Active' 'Stopped' 'Completed' 'Cleaning'>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 1:
       print "transformation and status not supplied"
       return
@@ -175,7 +167,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
        usage: start <transName|ID>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no transformation supplied"
       return
@@ -195,7 +187,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
        usage: stop <transID|ID>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no transformation supplied"
       return
@@ -214,7 +206,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
        usage: flush <transName|ID>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no transformation supplied"
       return
@@ -230,7 +222,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: get <transName|ID>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no transformation supplied"
       return
@@ -247,7 +239,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: getBody <transName|ID>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no transformation supplied"
       return
@@ -263,7 +255,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
      usage: getFileStat <transName|ID>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no transformation supplied"
       return
@@ -280,7 +272,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
        usage: modInput <mask> <transName|ID>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no transformation supplied"
       return
@@ -298,7 +290,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: getFiles <transName|ID> [Status] [Status]
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no transformation supplied"
       return
@@ -315,7 +307,8 @@ class TransformationCLI( cmd.Cmd, API ):
       if not res['OK']:
         print "Failed to get transformation files: %s" % res['Message']
       elif res['Value']:
-        self._printFormattedDictList( res['Value'], ['LFN', 'Status', 'ErrorCount', 'TargetSE', 'LastUpdate'], 'LFN', 'LFN' )
+        self._printFormattedDictList( res['Value'], ['LFN', 'Status', 'ErrorCount', 'TargetSE', 'LastUpdate'],
+                                      'LFN', 'LFN' )
       else:
         print "No files found"
 
@@ -324,7 +317,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: getFileStatus <transName|ID> <lfn> [<lfn>...]
     """
-    argss = string.split( args )
+    argss = args.split()
     if len( argss ) < 2:
       print "transformation and file not supplied"
       return
@@ -345,7 +338,8 @@ class TransformationCLI( cmd.Cmd, API ):
           if fileDict['LFN'] in lfns:
             filesList.append( fileDict )
         if  filesList:
-          self._printFormattedDictList( filesList, ['LFN', 'Status', 'ErrorCount', 'TargetSE', 'LastUpdate'], 'LFN', 'LFN' )
+          self._printFormattedDictList( filesList, ['LFN', 'Status', 'ErrorCount', 'TargetSE', 'LastUpdate'],
+                                        'LFN', 'LFN' )
         else:
           print "Could not find any LFN in", lfns, "for transformation", transName
       else:
@@ -356,7 +350,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: setFileStatus <transName|ID> <lfn> <status>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) == 3:
       print "transformation file and status not supplied"
       return
@@ -374,7 +368,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: resetFile <transName|ID> <lfn>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 1:
       print "transformation and file(s) not supplied"
       return
@@ -384,7 +378,34 @@ class TransformationCLI( cmd.Cmd, API ):
     if not res['OK']:
       print "Failed to reset file status: %s" % res['Message']
     else:
-      print "Updated file statuses to 'Unused' for %d file(s)" % len( lfns )
+      if res['Value']['Failed']:
+        print "Could not reset some files: "
+        for lfn, reason in res['Value']['Failed'].items():
+          print lfn, reason
+      else:
+        print "Updated file statuses to 'Unused' for %d file(s)" % len( lfns )
+
+  def do_resetProcessedFile( self, args ):
+    """ Reset file status for the given transformation
+        usage: resetFile <transName|ID> <lfn>
+    """
+    argss = args.split() 
+    
+    if not len( argss ) > 1:
+      print "transformation and file(s) not supplied"
+      return
+    transName = argss[0]
+    lfns = argss[1:]
+    res = self.server.setFileStatusForTransformation( transName, 'Unused', lfns, force = True )
+    if not res['OK']:
+      print "Failed to reset file status: %s" % res['Message']
+    else:
+      if res['Value']['Failed']:
+        print "Could not reset some files: "
+        for lfn, reason in res['Value']['Failed'].items():
+          print lfn, reason
+      else:
+        print "Updated file statuses to 'Unused' for %d file(s)" % len( lfns )
 
   ####################################################################
   #
@@ -396,7 +417,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: addDirectory <directory> [directory]
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no directory supplied"
       return
@@ -412,7 +433,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
         usage: replicas <lfn> [lfn]
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no files supplied"
       return
@@ -435,13 +456,14 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: addFile <lfn> [lfn]
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no files supplied"
       return
     lfnDict = {}
     for lfn in argss:
-      lfnDict[lfn] = {'PFN':'IGNORED-PFN', 'SE':'IGNORED-SE', 'Size':0, 'GUID':'IGNORED-GUID', 'Checksum':'IGNORED-CHECKSUM'}
+      lfnDict[lfn] = {'PFN':'IGNORED-PFN', 'SE':'IGNORED-SE', 'Size':0, 'GUID':'IGNORED-GUID',
+                      'Checksum':'IGNORED-CHECKSUM'}
     res = self.server.addFile( lfnDict, force = True )
     if not res['OK']:
       print "failed to add any files: %s" % res['Message']
@@ -457,7 +479,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: removeFile <lfn> [lfn]
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 0:
       print "no files supplied"
       return
@@ -476,7 +498,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: addReplica <lfn> <se>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) == 2:
       print "no file info supplied"
       return
@@ -499,7 +521,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: removeReplica <lfn> <se>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) == 2:
       print "no file info supplied"
       return
@@ -522,7 +544,7 @@ class TransformationCLI( cmd.Cmd, API ):
 
     usage: setReplicaStatus <lfn> <status> <se>
     """
-    argss = string.split( args )
+    argss = args.split()
     if not len( argss ) > 2:
       print "no file info supplied"
       return
@@ -542,6 +564,5 @@ class TransformationCLI( cmd.Cmd, API ):
       print "updated replica status %s" % lfn
 
 if __name__ == "__main__":
-  import DIRAC
   cli = TransformationCLI()
   cli.cmdloop()

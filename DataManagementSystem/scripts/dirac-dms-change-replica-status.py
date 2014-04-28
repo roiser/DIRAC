@@ -1,9 +1,10 @@
 #! /usr/bin/env python
 ########################################################################
-# $HeadURL: svn+ssh://svn.cern.ch/reps/dirac/DIRAC/trunk/DIRAC/DataManagementSystem/scripts/dirac-dms-catalog-metadata.py $
+# $HeadURL$
 ########################################################################
-__RCSID__   = "$Id: dirac-dms-catalog-metadata.py 27909 2010-08-11 09:08:28Z acsmith $"
+__RCSID__   = "$Id$"
 
+from DIRAC           import exit as DIRACExit
 from DIRAC.Core.Base import Script 
 
 Script.setUsageMessage("""
@@ -15,13 +16,13 @@ Usage:
 
 Script.parseCommandLine()
 
-from DIRAC.DataManagementSystem.Client.ReplicaManager import CatalogInterface
-catalog = CatalogInterface()
+from DIRAC.Resources.Catalog.FileCatalog import FileCatalog
+catalog = FileCatalog()
 import sys,os
 
 if not len(sys.argv) == 4:
   Script.showHelp()
-  DIRAC.exit( -1 )
+  DIRACExit( -1 )
 else:
   inputFileName = sys.argv[1]
   se = sys.argv[2]
@@ -35,10 +36,10 @@ if os.path.exists(inputFileName):
 else:
   lfns = [inputFileName]
 
-res = catalog.getCatalogReplicas(lfns,True)
+res = catalog.getReplicas( lfns, True )
 if not res['OK']:
   print res['Message']
-  sys.exit()
+  DIRACExit( -1 )
 replicas = res['Value']['Successful']
 
 lfnDict = {}
@@ -48,7 +49,7 @@ for lfn in lfns:
   lfnDict[lfn]['Status'] = newStatus
   lfnDict[lfn]['PFN'] = replicas[lfn][se]
 
-res = catalog.setCatalogReplicaStatus(lfnDict)
+res = catalog.setReplicaStatus( lfnDict )
 if not res['OK']:
   print "ERROR:",res['Message']
 if res['Value']['Failed']:

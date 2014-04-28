@@ -1,27 +1,46 @@
 ########################################################################
-# $Id: SEManager.py 22623 2010-03-09 19:54:25Z acsmith $
+# $Id$
 ########################################################################
 """ DIRAC FileCatalog Storage Element Manager mix-in class """
 
-__RCSID__ = "$Id: SEManager.py 22623 2010-03-09 19:54:25Z acsmith $"
+__RCSID__ = "$Id$"
 
-from DIRAC                        import S_OK, S_ERROR, gConfig, gLogger
-from DIRAC.Core.Utilities.Pfn     import pfnunparse
-import threading,time
-from types import *
+from DIRAC import S_OK, S_ERROR, gLogger
+from DIRAC.Core.Utilities.Pfn import pfnunparse
+from DIRAC.ConfigurationSystem.Client.Helpers.Resources import Resources
+import threading, time, random
+from types import StringTypes, IntType, LongType
 
 class SEManagerBase:
 
-  def __init__(self,database=None):
-    self.db = database
+  _tables = {}
+  _tables['FC_StorageElements'] = { "Fields":
+                                     { 
+                                       "SEID": "INTEGER AUTO_INCREMENT",
+                                       "SEName": "VARCHAR(127) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL",
+                                       "SEPrefix": "VARCHAR(127) NOT NULL", 
+                                       "AliasName": "VARCHAR(127) DEFAULT ''"
+                                     }, 
+                                     "PrimaryKey": "SEID",
+                                     "UniqueIndexes": {"SEName":["SEName"]}  
+                                   }
+
+  def __init__( self, database=None ):
+    self.db = None
+    if database is not None:
+      self.setDatabase( database )
     self.lock = threading.Lock()
-    self._refreshSEs()
     self.seUpdatePeriod = 600
+    self.resourcesHelper = Resources()
+    self._refreshSEs()
     
-  def setUpdatePeriod(self,period): 
+  def _refreshSEs( self ):
+    return S_ERROR( 'Should be implemented in a derived class' )  
+    
+  def setUpdatePeriod( self, period ): 
     self.seUpdatePeriod = period
     
-  def setSEDefinitions(self,seDefinitions):
+  def setSEDefinitions( self, seDefinitions ):
     self.db.seDefinitions = seDefinitions
     self.seNames= {}
     for seID,seDef in self.db.seDefinitions.items():
@@ -30,6 +49,12 @@ class SEManagerBase:
 
   def setDatabase(self,database):
     self.db = database  
+    result = self.db._createTables( self._tables )
+    if not result['OK']:
+      gLogger.error( "Failed to create tables", str( self._tables.keys() ) )
+    elif result['Value']:
+      gLogger.info( "Tables created: %s" % ','.join( result['Value'] ) )  
+    return result
 
   def _getConnection(self,connection):
     if connection:
@@ -80,6 +105,13 @@ class SEManagerDB(SEManagerBase):
     if not res['OK']:
       gLogger.debug("SEManager AddSE lock released. Used %.3f seconds. %s" % (time.time()-waitTime,seName))
       self.lock.release()
+      if "Duplicate entry" in res['Message']:
+        result = self._refreshSEs( connection )
+        if not result['OK']:
+          return result
+        if seName in self.db.seNames.keys():
+          seid = self.db.seNames[seName]
+          return S_OK(seid)
       return res
     seid = res['lastRowId']
     self.db.seids[seid] = seName
@@ -160,12 +192,20 @@ class SEManagerDB(SEManagerBase):
       self.db.seDefinitions[seID]['LastUpdate'] = 0.
       
     # We have to refresh the SE definition from the CS
-    result = gConfig.getOptionsDict('/Resources/StorageElements/%s/AccessProtocol.1' % se)
+    result = self.resourcesHelper.getStorageElementOptionsDict( se )
     if not result['OK']:
       return result
     seDict = result['Value']
     self.db.seDefinitions[seID]['SEDict'] = seDict
     if seDict:
+      # A.T. Ports can be multiple, this can be better done using the Storage plugin
+      # to provide the replica prefix to keep implementations in one place
+      if 'Port' in seDict:
+        ports = seDict['Port']
+        if ',' in ports:
+          portList = [ x.strip() for x in ports.split(',') ]
+          random.shuffle( portList )
+          seDict['Port'] = portList[0]  
       tmpDict = dict(seDict)
       tmpDict['FileName'] = ''
       result = pfnunparse(tmpDict)
@@ -173,6 +213,20 @@ class SEManagerDB(SEManagerBase):
         self.db.seDefinitions[seID]['SEDict']['PFNPrefix'] = result['Value'] 
     self.db.seDefinitions[seID]['LastUpdate'] = time.time()
     return S_OK(self.db.seDefinitions[seID])
+
+  def getSEPrefixes( self, connection=False ):
+    
+    result = self._refreshSEs(connection)
+    if not result['OK']:
+      return result
+    
+    resultDict = {}
+    
+    for seID in self.db.seDefinitions:
+      resultDict[self.db.seDefinitions[seID]['SEName']] = \
+         self.db.seDefinitions[seID]['SEDict'].get( 'PFNPrefix', '' )
+
+    return S_OK( resultDict )
 
 class SEManagerCS(SEManagerBase):
 
@@ -184,4 +238,4 @@ class SEManagerCS(SEManagerBase):
   
   def getSEDefinition(self,se):
     #TODO Think about using a cache for this information
-    return gConfig.getOptionsDict('/Resources/StorageElements/%s/AccessProtocol.1' % se)
+    return self.resourcesHelper.getStorageElementOptionsDict( se )

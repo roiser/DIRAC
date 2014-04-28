@@ -3,6 +3,7 @@ __RCSID__ = "$Id$"
 
 import time
 import select
+import cStringIO
 try:
   from hashlib import md5
 except:
@@ -34,6 +35,7 @@ class BaseTransport:
     self.sentKeepAlives = 0
     self.waitingForKeepAlivePong = False
     self.__keepAliveLapse = 0
+    self.oSocket = None
     if 'keepAliveLapse' in kwargs:
       try:
         self.__keepAliveLapse = max( 150, int( kwargs[ 'keepAliveLapse' ] ) )
@@ -79,9 +81,6 @@ class BaseTransport:
   def serverMode( self ):
     return self.bServerMode
 
-  def getTransportName( self ):
-    return self.sTransportName
-
   def getRemoteAddress( self ):
     return self.remoteAddress
 
@@ -90,9 +89,6 @@ class BaseTransport:
 
   def getSocket( self ):
     return self.oSocket
-
-  def _write( self, sBuffer ):
-    self.oSocket.send( sBuffer )
 
   def _readReady( self ):
     if not self.iReadTimeout:
@@ -126,7 +122,7 @@ class BaseTransport:
     else:
       dataToSend = "%s:%s" % ( len( sCodedData ), sCodedData )
     for index in range( 0, len( dataToSend ), self.packetSize ):
-      bytesToSend = len( dataToSend[ index : index + self.packetSize ] )
+      bytesToSend = min( self.packetSize, len( dataToSend ) - index )
       packSentBytes = 0
       while packSentBytes < bytesToSend:
         try:
@@ -155,7 +151,7 @@ class BaseTransport:
       isKeepAlive = self.byteStream.find( BaseTransport.keepAliveMagic, 0, keepAliveMagicLen ) == 0
       #While not found the message length or the ka, keep receiving
       while iSeparatorPosition == -1 and not isKeepAlive:
-        retVal = self._read( 1024 )
+        retVal = self._read( 16384 )
         #If error return
         if not retVal[ 'OK' ]:
           return retVal
@@ -178,21 +174,37 @@ class BaseTransport:
         return self.__processKeepAlive( maxBufferSize, blockAfterKeepAlive )
       #From here it must be a real message!
       #Process the size and remove the msg length from the bytestream
-      size = int( self.byteStream[ :iSeparatorPosition ] )
-      self.byteStream = self.byteStream[ iSeparatorPosition + 1: ]
-      #Receive while there's still data to be received 
-      while len( self.byteStream ) < size:
-        retVal = self._read( size - len( self.byteStream ), skipReadyCheck = True )
-        if not retVal[ 'OK' ]:
-          return retVal
-        if not retVal[ 'Value' ]:
-          return S_ERROR( "Peer closed connection" )
-        self.byteStream += retVal[ 'Value' ]
-        if maxBufferSize and len( self.byteStream ) > maxBufferSize:
-          return S_ERROR( "Read limit exceeded (%s chars)" % maxBufferSize )
-      #Data is here! take it out from the bytestream, dencode and return
-      data = self.byteStream[ :size ]
-      self.byteStream = self.byteStream[ size: ]
+      pkgSize = int( self.byteStream[ :iSeparatorPosition ] )
+      pkgData = self.byteStream[ iSeparatorPosition + 1: ]
+      readSize = len( pkgData )
+      if readSize >= pkgSize:
+        #If we already have all the data we need
+        data = pkgData[ :pkgSize ]
+        self.byteStream = pkgData[ pkgSize: ]
+      else:
+        #If we still need to read stuff
+        pkgMem = cStringIO.StringIO()
+        pkgMem.write( pkgData )
+        #Receive while there's still data to be received
+        while readSize < pkgSize:
+          retVal = self._read( pkgSize - readSize, skipReadyCheck = True )
+          if not retVal[ 'OK' ]:
+            return retVal
+          if not retVal[ 'Value' ]:
+            return S_ERROR( "Peer closed connection" )
+          rcvData = retVal[ 'Value' ]
+          readSize += len( rcvData )
+          pkgMem.write( rcvData )
+          if maxBufferSize and readSize > maxBufferSize:
+            return S_ERROR( "Read limit exceeded (%s chars)" % maxBufferSize )
+        #Data is here! take it out from the bytestream, dencode and return
+        if readSize == pkgSize:
+          data = pkgMem.getvalue()
+          self.byteStream = ""
+        else: #readSize > pkgSize:
+          pkgMem.seek( 0, 0 )
+          data = pkgMem.read( pkgSize )
+          self.byteStream = pkgMem.read()
       try:
         data = DEncode.decode( data )[0]
       except Exception, e:

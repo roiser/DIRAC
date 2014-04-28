@@ -45,11 +45,11 @@ import DIRAC
 from DIRAC                                                   import gLogger
 from DIRAC.ConfigurationSystem.Client.Helpers.Registry       import getVOForGroup
 from DIRAC.Core.Security.ProxyInfo                           import getProxyInfo
-from DIRAC.DataManagementSystem.Client.ReplicaManager        import ReplicaManager
+from DIRAC.Resources.Catalog.FileCatalog import FileCatalog
 from DIRAC.Core.Utilities.List                               import sortList
 from datetime import datetime, timedelta
 import sys, os, time, fnmatch
-rm = ReplicaManager()
+fc = FileCatalog()
 
 def isOlderThan( cTimeStruct, days ):
   timeDelta = timedelta( days = days )
@@ -75,15 +75,13 @@ if not res['OK']:
   DIRAC.exit( 2 )
 proxyInfo = res['Value']
 username = proxyInfo['username']
-
 vo = ''
 if 'group' in proxyInfo:
   vo = getVOForGroup( proxyInfo['group'] )
-if not vo:
-  gLogger.error( 'Could not determine VO' )
-  Script.showHelp()
-
 if not baseDir:
+  if not vo:
+    gLogger.error( 'Could not determine VO' )
+    Script.showHelp()
   baseDir = '/%s/user/%s/%s' % ( vo, username[0], username )
 
 gLogger.info( 'Will search for files in %s' % baseDir )
@@ -93,7 +91,7 @@ allFiles = []
 emptyDirs = []
 while len( activeDirs ) > 0:
   currentDir = activeDirs[0]
-  res = rm.getCatalogListDirectory( currentDir, verbose )
+  res = fc.listDirectory( currentDir, verbose )
   activeDirs.remove( currentDir )
   if not res['OK']:
     gLogger.error( "Error retrieving directory contents", "%s %s" % ( currentDir, res['Message'] ) )

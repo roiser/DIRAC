@@ -1,5 +1,4 @@
 ########################################################################
-# $HeadURL$
 # File :   TaskQueueDirector.py
 # Author : Stuart Paterson, Ricardo Graciani
 ########################################################################
@@ -126,18 +125,20 @@
 """
 __RCSID__ = "$Id$"
 
-from DIRAC.Core.Base.AgentModule import AgentModule
+import random, time, threading
+from DIRAC                                                       import S_OK, S_ERROR, List, Time, abort
+from DIRAC.Core.Utilities.ThreadPool                             import ThreadPool
+from DIRAC.Core.Utilities.ObjectLoader                           import ObjectLoader
+from DIRAC.Core.DISET.RPCClient                                  import RPCClient
+from DIRAC.Core.Base.AgentModule                                 import AgentModule
+from DIRAC.ConfigurationSystem.Client.Helpers.Resources          import getDIRACPlatforms
+from DIRAC.Resources.Computing.ComputingElement                  import getResourceDict
+from DIRAC.WorkloadManagementSystem.Client.ServerUtils           import pilotAgentsDB
 
-from DIRAC.WorkloadManagementSystem.private.gLitePilotDirector   import gLitePilotDirector
-from DIRAC.WorkloadManagementSystem.private.LCGPilotDirector     import LCGPilotDirector
-from DIRAC.WorkloadManagementSystem.private.DIRACPilotDirector   import DIRACPilotDirector
-
-from DIRAC.Resources.Computing.ComputingElement import getResourceDict
-
-from DIRAC.WorkloadManagementSystem.Client.ServerUtils     import pilotAgentsDB, taskQueueDB
-
-from DIRAC.Core.Utilities.ThreadPool                       import ThreadPool
-from DIRAC import S_OK, S_ERROR, List, Time, DictCache
+from DIRAC.Core.Utilities                                        import List, Time
+from DIRAC.Core.Utilities.ThreadPool                             import ThreadPool
+from DIRAC.Core.DISET.RPCClient                                  import RPCClient
+from DIRAC                                                       import S_OK, S_ERROR, gConfig
 
 import random, time
 import DIRAC
@@ -158,8 +159,6 @@ class TaskQueueDirector( AgentModule ):
   def initialize( self ):
     """ Standard constructor
     """
-    import threading
-
     self.am_setOption( "PollingTime", 60.0 )
 
     self.am_setOption( "pilotsPerIteration", 40.0 )
@@ -172,10 +171,11 @@ class TaskQueueDirector( AgentModule ):
     self.am_setOption( 'SubmitPools', [] )
     self.am_setOption( 'DefaultSubmitPools', [] )
 
-
     self.am_setOption( 'minThreadsInPool', 0 )
     self.am_setOption( 'maxThreadsInPool', 2 )
     self.am_setOption( 'totalThreadsInPool', 40 )
+
+    self.directorsImportLine = self.am_getOption( 'directorsImportLine', 'DIRAC.WorkloadManagementSystem.private' )
 
     self.directors = {}
     self.pools = {}
@@ -196,8 +196,16 @@ class TaskQueueDirector( AgentModule ):
     self.__checkSubmitPools()
 
     self.directorDict = getResourceDict()
+    #Add all submit pools
+    self.directorDict[ 'SubmitPool' ] = self.am_getOption( "SubmitPools" )
+    #Add all DIRAC platforms if not specified otherwise
+    if not 'Platform' in self.directorDict:
+      result = getDIRACPlatforms()
+      if result['OK']:
+        self.directorDict['Platform'] = result['Value']
 
-    result = taskQueueDB.getMatchingTaskQueues( self.directorDict )
+    rpcMatcher = RPCClient( "WorkloadManagement/Matcher" )
+    result = rpcMatcher.getMatchingTaskQueues( self.directorDict )
     if not result['OK']:
       self.log.error( 'Could not retrieve TaskQueues from TaskQueueDB', result['Message'] )
       return result
@@ -383,8 +391,7 @@ class TaskQueueDirector( AgentModule ):
     """
 
     self.log.info( 'Creating Director for SubmitPool:', submitPool )
-    # 1. check the GridMiddleware
-    # Comprobar esto
+    # check the GridMiddleware
     directorGridMiddleware = self.am_getOption( submitPool + '/GridMiddleware', '' )
     if not directorGridMiddleware:
       self.log.error( 'No Director GridMiddleware defined for SubmitPool:', submitPool )
@@ -392,14 +399,14 @@ class TaskQueueDirector( AgentModule ):
 
     directorName = '%sPilotDirector' % directorGridMiddleware
 
-    try:
-      self.log.info( 'Instantiating Director Object:', directorName )
-      director = eval( '%s( "%s" )' % ( directorName, submitPool ) )
-    except Exception, x:
-      self.log.exception()
-      return
+    self.log.info( 'Instantiating Director Object:', directorName )
 
-    self.log.info( 'Director Object instantiated:', directorName )
+    # loading the module
+    directorM = ObjectLoader().loadModule( "WorkloadManagementSystem.private.%s" % directorName )
+    if not directorM:
+      return directorM
+    # instantiating the director object passing submitPool
+    director = getattr( directorM['Value'], directorName )( submitPool )
 
     # 2. check the requested ThreadPool (if not defined use the default one)
     directorPool = self.am_getOption( submitPool + '/Pool', 'Default' )
@@ -418,8 +425,6 @@ class TaskQueueDirector( AgentModule ):
 
     self.log.verbose( 'Created Director for SubmitPool', submitPool )
 
-    return
-
   def __configureDirector( self, submitPool = None ):
     """
       Update Configuration from CS
@@ -436,7 +441,7 @@ class TaskQueueDirector( AgentModule ):
 
     else:
       if submitPool not in self.directors:
-        DIRAC.abort( -1, "Submit Pool not available", submitPool )
+        abort( -1, "Submit Pool not available", submitPool )
       director = self.directors[submitPool]['director']
 
       # Pass reference to our CS section so that defaults can be taken from there

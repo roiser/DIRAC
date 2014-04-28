@@ -10,13 +10,12 @@
 __RCSID__ = "$Id$"
 
 from DIRAC.Resources.Computing.ComputingElement          import ComputingElement
-from DIRAC.FrameworkSystem.Client.ProxyManagerClient     import gProxyManager
 from DIRAC.Core.Utilities.ThreadScheduler                import gThreadScheduler
 from DIRAC.Core.Utilities.Subprocess                     import systemCall
 from DIRAC.Core.Security.ProxyInfo                       import getProxyInfo
-from DIRAC                                               import gConfig, S_OK, S_ERROR
+from DIRAC                                               import S_OK, S_ERROR
 
-import os, sys
+import os
 
 MandatoryParameters = [ ]
 
@@ -64,7 +63,11 @@ class InProcessComputingElement( ComputingElement ):
       payloadEnv[ 'X509_USER_PROXY' ] = payloadProxy
 
     self.log.verbose( 'Starting process for monitoring payload proxy' )
-    gThreadScheduler.addPeriodicTask( self.proxyCheckPeriod, self.monitorProxy, taskArgs = ( pilotProxy, payloadProxy ), executions = 0, elapsedTime = 0 )
+
+    renewTask = None
+    result = gThreadScheduler.addPeriodicTask( self.proxyCheckPeriod, self.monitorProxy, taskArgs = ( pilotProxy, payloadProxy ), executions = 0, elapsedTime = 0 )
+    if result[ 'OK' ]:
+      renewTask = result[ 'Value' ]
 
     if not os.access( executableFile, 5 ):
       os.chmod( executableFile, 0755 )
@@ -74,16 +77,28 @@ class InProcessComputingElement( ComputingElement ):
     if payloadProxy:
       os.unlink( payloadProxy )
 
+    if renewTask:
+      gThreadScheduler.removeTask( renewTask )
+
     ret = S_OK()
 
     if not result['OK']:
       self.log.error( 'Fail to run InProcess', result['Message'] )
-    elif result['Value'][0] < 0:
-      self.log.error( 'InProcess Job Execution Failed' )
-      self.log.info( 'Exit status:', result['Value'][0] )
-      return S_ERROR( 'InProcess Job Execution Failed' )
+    elif result['Value'][0] > 128:
+      # negative exit values are returned as 256 - exit
+      self.log.warn( 'InProcess Job Execution Failed' )
+      self.log.info( 'Exit status:', result['Value'][0] - 256 )
+      if result['Value'][0] - 256 == -2:
+        error = 'Error in the initialization of the DIRAC JobWrapper'
+      elif result['Value'][0] - 256 == -1:
+        error = 'Error in the execution of the DIRAC JobWrapper'
+      else:
+        error = 'InProcess Job Execution Failed'
+      res = S_ERROR( error )
+      res['Value'] = result['Value'][0] - 256
+      return res
     elif result['Value'][0] > 0:
-      self.log.error( 'Fail in payload execution' )
+      self.log.warn( 'Fail in payload execution' )
       self.log.info( 'Exit status:', result['Value'][0] )
       ret['PayloadFailed'] = result['Value'][0]
     else:
@@ -93,7 +108,7 @@ class InProcessComputingElement( ComputingElement ):
     return ret
 
   #############################################################################
-  def getDynamicInfo( self ):
+  def getCEStatus( self ):
     """ Method to return information on running and pending jobs.
     """
     result = S_OK()

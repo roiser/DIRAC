@@ -1,19 +1,22 @@
-################################################################################
 # $HeadURL:  $
-################################################################################
-__RCSID__  = "$Id:  $"
-AGENT_NAME = 'ResourceStatus/CacheFeederAgent'
+''' CacheFeederAgent
 
-from datetime import datetime
+  This agent feeds the Cache tables with the outputs of the cache commands.
 
-from DIRAC                                                      import S_OK, S_ERROR
-from DIRAC                                                      import gLogger
+'''
+
+from DIRAC                                                      import S_OK
+from DIRAC.AccountingSystem.Client.ReportsClient                import ReportsClient
 from DIRAC.Core.Base.AgentModule                                import AgentModule
-
+from DIRAC.Core.DISET.RPCClient                                 import RPCClient
+from DIRAC.Core.LCG.GOCDBClient                                 import GOCDBClient
 from DIRAC.ResourceStatusSystem.Client.ResourceManagementClient import ResourceManagementClient
-from DIRAC.ResourceStatusSystem.Command.CommandCaller           import CommandCaller
-from DIRAC.ResourceStatusSystem.Command.ClientsInvoker          import ClientsInvoker
-from DIRAC.ResourceStatusSystem.Command.knownAPIs               import initAPIs
+from DIRAC.ResourceStatusSystem.Client.ResourceStatusClient     import ResourceStatusClient
+from DIRAC.ResourceStatusSystem.Command                         import CommandCaller
+from DIRAC.WorkloadManagementSystem.DB.PilotAgentsDB            import PilotAgentsDB
+
+__RCSID__  = '$Id:  $'
+AGENT_NAME = 'ResourceStatus/CacheFeederAgent'
 
 class CacheFeederAgent( AgentModule ):
   '''
@@ -22,178 +25,123 @@ class CacheFeederAgent( AgentModule ):
   tables.
   '''
 
+  # Too many public methods
+  # pylint: disable=R0904  
+
+  def __init__( self, *args, **kwargs ):
+    
+    AgentModule.__init__( self, *args, **kwargs )
+    
+    self.commands = {}
+    self.clients  = {} 
+    
+    self.cCaller  = None
+    self.rmClient = None
+
   def initialize( self ):
 
-    try:
+    self.am_setOption( 'shifterProxy', 'DataManager' )
 
-      self.rmClient       = ResourceManagementClient()
-      self.clientsInvoker = ClientsInvoker()
+    self.rmClient = ResourceManagementClient()
 
-      commandsList_ClientsCache = [
-        ( 'ClientsCache_Command', 'JobsEffSimpleEveryOne_Command'     ),
-        ( 'ClientsCache_Command', 'PilotsEffSimpleEverySites_Command' ),
-        ( 'ClientsCache_Command', 'DTEverySites_Command'              ),
-        ( 'ClientsCache_Command', 'DTEveryResources_Command'          )
-        ]
+    self.commands[ 'Downtime' ]            = [ { 'Downtime'            : {} } ]
+    self.commands[ 'SpaceTokenOccupancy' ] = [ { 'SpaceTokenOccupancy' : {} } ]
+    self.commands[ 'Pilot' ]               = [ { 'Pilot' : { 'timespan' : 1800 } },]
+#                                               { 'Pilot' : { 'timespan' : 86400 } },
+#                                               { 'Pilot' : { 'timespan' : 604800 } }]
+ 
+    
+    #PilotsCommand
+#    self.commands[ 'Pilots' ] = [ 
+#                                 { 'PilotsWMS' : { 'element' : 'Site', 'siteName' : None } },
+#                                 { 'PilotsWMS' : { 'element' : 'Resource', 'siteName' : None } } 
+#                                 ]
+        
 
-      commandsList_AccountingCache =  [
-        ( 'AccountingCache_Command', 'TransferQualityByDestSplitted_Command',     ( 2, ),    'Always' ),
-        ( 'AccountingCache_Command', 'FailedTransfersBySourceSplitted_Command',   ( 2, ),    'Always' ),
-        ( 'AccountingCache_Command', 'TransferQualityByDestSplittedSite_Command', ( 24, ),   'Hourly' ),
-        ( 'AccountingCache_Command', 'SuccessfullJobsBySiteSplitted_Command',     ( 24, ),   'Hourly' ),
-        ( 'AccountingCache_Command', 'FailedJobsBySiteSplitted_Command',          ( 24, ),   'Hourly' ),
-        ( 'AccountingCache_Command', 'SuccessfullPilotsBySiteSplitted_Command',   ( 24, ),   'Hourly' ),
-        ( 'AccountingCache_Command', 'FailedPilotsBySiteSplitted_Command',        ( 24, ),   'Hourly' ),
-        ( 'AccountingCache_Command', 'SuccessfullPilotsByCESplitted_Command' ,    ( 24, ),   'Hourly' ),
-        ( 'AccountingCache_Command', 'FailedPilotsByCESplitted_Command',          ( 24, ),   'Hourly' ),
-        ( 'AccountingCache_Command', 'RunningJobsBySiteSplitted_Command',         ( 24, ),   'Hourly' ),
-        ( 'AccountingCache_Command', 'RunningJobsBySiteSplitted_Command',         ( 168, ),  'Hourly' ),
-        ( 'AccountingCache_Command', 'RunningJobsBySiteSplitted_Command',         ( 720, ),  'Daily'  ),
-        ( 'AccountingCache_Command', 'RunningJobsBySiteSplitted_Command',         ( 8760, ), 'Daily'  ),
-        ]
+    #FIXME: do not forget about hourly vs Always ...etc                                                                       
+    #AccountingCacheCommand
+#    self.commands[ 'AccountingCache' ] = [
+#                                          {'SuccessfullJobsBySiteSplitted'    :{'hours' :24, 'plotType' :'Job' }},
+#                                          {'FailedJobsBySiteSplitted'         :{'hours' :24, 'plotType' :'Job' }},
+#                                          {'SuccessfullPilotsBySiteSplitted'  :{'hours' :24, 'plotType' :'Pilot' }},
+#                                          {'FailedPilotsBySiteSplitted'       :{'hours' :24, 'plotType' :'Pilot' }},
+#                                          {'SuccessfullPilotsByCESplitted'    :{'hours' :24, 'plotType' :'Pilot' }},
+#                                          {'FailedPilotsByCESplitted'         :{'hours' :24, 'plotType' :'Pilot' }},
+#                                          {'RunningJobsBySiteSplitted'        :{'hours' :24, 'plotType' :'Job' }},
+##                                          {'RunningJobsBySiteSplitted'        :{'hours' :168, 'plotType' :'Job' }},
+##                                          {'RunningJobsBySiteSplitted'        :{'hours' :720, 'plotType' :'Job' }},
+##                                          {'RunningJobsBySiteSplitted'        :{'hours' :8760, 'plotType' :'Job' }},    
+#                                          ]                                  
+    
+    #VOBOXAvailability
+#    self.commands[ 'VOBOXAvailability' ] = [
+#                                            { 'VOBOXAvailability' : {} }
+#   
+    
+    #Reuse clients for the commands
+    self.clients[ 'GOCDBClient' ]              = GOCDBClient()
+    self.clients[ 'ReportGenerator' ]          = RPCClient( 'Accounting/ReportGenerator' )
+    self.clients[ 'ReportsClient' ]            = ReportsClient()
+    self.clients[ 'ResourceStatusClient' ]     = ResourceStatusClient()
+    self.clients[ 'ResourceManagementClient' ] = ResourceManagementClient()
+    self.clients[ 'PilotsDB' ]                 = PilotAgentsDB()
+    self.clients[ 'WMSAdministrator' ]         = RPCClient( 'WorkloadManagement/WMSAdministrator' )
 
-      self.commandObjectsList_ClientsCache    = []
-      self.commandObjectsList_AccountingCache = []
+    self.cCaller = CommandCaller
+    
+    return S_OK()
 
-      cc = CommandCaller()
+  def loadCommand( self, commandModule, commandDict ):
 
-      # We know beforehand which APIs are we going to need, so we initialize them
-      # first, making everything faster.
-      APIs = [ 'ResourceStatusClient', 'WMSAdministrator', 'ReportGenerator',
-               'JobsClient', 'PilotsClient', 'GOCDBClient', 'ReportsClient' ]
-      APIs = initAPIs( APIs, {} )
+    commandName = commandDict.keys()[ 0 ]
+    commandArgs = commandDict[ commandName ]
 
-      for command in commandsList_ClientsCache:
+    commandTuple  = ( '%sCommand' % commandModule, '%sCommand' % commandName )
+    commandObject = self.cCaller.commandInvocation( commandTuple, pArgs = commandArgs,
+                                                    clients = self.clients )
+        
+    if not commandObject[ 'OK' ]:
+      self.log.error( 'Error initializing %s' % commandName )
+      return commandObject
+    commandObject = commandObject[ 'Value' ]
+    
+    # Set master mode
+    commandObject.masterMode = True
+        
+    self.log.info( '%s/%s' % ( commandModule, commandName ) )
 
-        cObj = cc.setCommandObject( command )
-        for apiName, apiInstance in APIs.items():
-          cc.setAPI( cObj, apiName, apiInstance )
-
-        self.commandObjectsList_ClientsCache.append( ( command, cObj ) )
-
-      for command in commandsList_AccountingCache:
-
-        cObj = cc.setCommandObject( command )
-        for apiName, apiInstance in APIs.items():
-          cc.setAPI( cObj, apiName, apiInstance )
-        cArgs = command[ 2 ]
-
-        self.commandObjectsList_AccountingCache.append( ( command, cObj, cArgs ) )
-
-      return S_OK()
-
-    except Exception:
-      errorStr = "CacheFeederAgent initialization"
-      gLogger.exception( errorStr )
-      return S_ERROR( errorStr )
-
-################################################################################
+    return S_OK( commandObject )
+        
 
   def execute( self ):
-
-    try:
-
-      for co in self.commandObjectsList_ClientsCache:
-
-        commandName = co[0][1].split( '_' )[0]
-        gLogger.info( 'Executed %s' % commandName )
-        try:
-          self.clientsInvoker.setCommand( co[1] )
-          res = self.clientsInvoker.doCommand()['Result']
-
-          if not res['OK']:
-            gLogger.warn( res['Message'] )
-            continue
-          res = res[ 'Value' ]
-
-          if not res or res is None:
-            gLogger.info('  returned empty...')
-            continue
-          gLogger.debug( res )
-
-          for key in res.keys():
-
-            clientCache = ()
-
-            if 'ID' in res[key].keys():
-
-              for value in res[key].keys():
-                if value != 'ID':
-                  clientCache = ( key.split()[1], commandName, res[key]['ID'],
-                                  value, res[key][value], None, None )
-
-                  resQuery = self.rmClient.addOrModifyClientCache( *clientCache )
-                  if not resQuery[ 'OK' ]:
-                    gLogger.error( resQuery[ 'Message' ] )
-
-            else:
-              for value in res[key].keys():
-                clientCache = ( key, commandName, None, value,
-                                res[key][value], None, None )
-
-                resQuery = self.rmClient.addOrModifyClientCache( *clientCache )
-                if not resQuery[ 'OK' ]:
-                  gLogger.error( resQuery[ 'Message' ] )
-
-        except:
-          gLogger.exception( "Exception when executing " + co[0][1] )
+      
+    for commandModule, commandList in self.commands.items():
+      
+      self.log.info( '%s module initialization' % commandModule )
+      
+      for commandDict in commandList:
+      
+        commandObject = self.loadCommand( commandModule, commandDict )
+        if not commandObject[ 'OK' ]:
+          self.log.error( commandObject[ 'Message' ] )
           continue
-
-      now = datetime.utcnow().replace( microsecond = 0 )
-
-      for co in self.commandObjectsList_AccountingCache:
-
-        if co[0][3] == 'Hourly':
-          if now.minute >= 10:
-            continue
-        elif co[0][3] == 'Daily':
-          if now.hour >= 1:
-            continue
-
-        commandName = co[0][1].split( '_' )[0]
-        plotName    = commandName + '_' + str( co[2][0] )
-
-        gLogger.info( 'Executed %s with args %s %s' % ( commandName, co[0][2], co[0][3] ) )
-
-        try:
-          co[1].setArgs( co[2] )
-          self.clientsInvoker.setCommand( co[1] )
-          res = self.clientsInvoker.doCommand()['Result']
-
-          if not res['OK']:
-            gLogger.warn( res['Message'] )
-            continue
-          res = res[ 'Value' ]
-
-          if not res or res is None:
-            gLogger.info('  returned empty...')
-            continue
-          gLogger.debug( res )
-
-          plotType = res.keys()[ 0 ]
-
-          if not res[ plotType ]:
-            gLogger.info('  returned empty...')
-          gLogger.debug( res )
-
-          for name in res[ plotType ].keys():
-
-            #name, plotType, plotName, result, dateEffective, lastCheckTime
-            accountingClient = ( name, plotType, plotName, str(res[plotType][name]), None, None )
-            resQuery = self.rmClient.addOrModifyAccountingCache( *accountingClient )
-            if not resQuery[ 'OK' ]:
-              gLogger.error( resQuery[ 'Message' ] )
-
-        except:
-          gLogger.exception( "Exception when executing " + commandName )
+        commandObject = commandObject[ 'Value' ]
+                  
+        results = commandObject.doCommand()
+                    
+        if not results[ 'OK' ]:
+          self.log.error( results[ 'Message' ] )
           continue
+        results = results[ 'Value' ]
 
-      return S_OK()
-
-    except Exception:
-      errorStr = "CacheFeederAgent execution"
-      gLogger.exception( errorStr )
-      return S_ERROR( errorStr )
-
+        if not results:
+          self.log.info( 'Empty results' )
+          continue
+          
+        self.log.verbose( 'Command OK Results' )  
+        self.log.verbose( results )
+          
+    return S_OK()  
+     
 ################################################################################
 #EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF

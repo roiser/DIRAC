@@ -1,3 +1,5 @@
+# TODO: to be removed
+
 ########################################################################
 # $HeadURL $
 # File: RegisterTaskTests.py
@@ -13,6 +15,9 @@
     .. moduleauthor:: Krzysztof.Ciba@NOSPAMgmail.com
 
     unit tests for RegisterTask
+
+  OBSOLETE
+  K.C.
 """
 
 __RCSID__ = "$Id $"
@@ -26,9 +31,7 @@ __RCSID__ = "$Id $"
 ## imports 
 import unittest
 from mock import *
-
 global MySQL, DB, RequestDBMySQL
-
 from DIRAC.Core.Utilities.MySQL import MySQL
 MySQL = Mock(spec=MySQL)
 from DIRAC.Core.Base.DB import DB
@@ -40,9 +43,9 @@ RequestClient = Mock(spec=RequestClient)
 from DIRAC.DataManagementSystem.Client.DataLoggingClient import DataLoggingClient
 DataLoggingClient = Mock(spec=DataLoggingClient)
 from DIRAC.RequestManagementSystem.Client.RequestContainer import RequestContainer
-from DIRAC.DataManagementSystem.Client.ReplicaManager import ReplicaManager
-ReplicaManager = Mock(spec=ReplicaManager)
-from DIRAC.DataManagementSystem.Agent.RegistrationTask import RegistrationTask
+from DIRAC.DataManagementSystem.Client.DataManager import DataManager
+DataManager = Mock( spec = DataManager )
+from DIRAC.DataManagementSystem.private.RegistrationTask import RegistrationTask
 
 from DIRAC.FrameworkSystem.Client.ProxyManagerClient import gProxyManager 
 gProxyManager = Mock( spec=gProxyManager.__class__ )
@@ -119,19 +122,26 @@ class RegisterTaskTests(unittest.TestCase):
     self.registerTask.requestClient().updateRequest = Mock()
     self.registerTask.requestClient().updateRequest.return_value = { "OK" : True, "Value" : None }
 
+    self.registerTask.requestClient().getRequestStatus = Mock()
+    self.registerTask.requestClient().getRequestStatus.return_value = { "OK" : True, 
+                                                                        "Value" : { "RequestStatus" : "Done", 
+                                                                                    "SubRequestStatus" : "Done" }}
+
+
     self.registerTask.requestClient().finalizeRequest = Mock()
     self.registerTask.requestClient().finalizeRequest.return_value = { "OK" : True, "Value" : None }
 
-    self.registerTask.replicaManager = Mock( return_value = Mock( spec=ReplicaManager) )
-    self.registerTask.replicaManager().registerFile = Mock()
-    self.registerTask.replicaManager().registerFile.return_value =  { "OK" : True,
+    self.registerTask.dataManager = Mock( return_value = Mock( spec = DataManager ) )
+    self.registerTask.dm.registerFile = Mock()
+    self.registerTask.dm.registerFile.return_value = { "OK" : True,
                                                                     "Value" : 
                                                                     { "Failed" : {},
                                                                       "Succesfull" : { "/lhcb/user/c/cblanks/11889/11889410/LDSB.rsQrRL" : True } } } 
 
   def test_01_call( self ):
     """ call test """
-    self.assertEqual( self.registerTask.__call__(), {'OK': True, 'Value': {'monitor': {'Execute': 1, 'Done': 1}}} )
+    self.assertEqual( self.registerTask.__call__(), { 'OK': True, 
+                                                      'Value': { 'monitor': { 'Execute': 1, 'Done': 1} } } )
 
 
 ## suite execution

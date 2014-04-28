@@ -8,7 +8,7 @@
   Remove Site from Active mask for current Setup
 """
 __RCSID__ = "$Id$"
-import DIRAC
+
 from DIRAC.Core.Base import Script
 
 Script.registerSwitch( "E:", "email=", "Boolean True/False (True by default)" )
@@ -20,10 +20,11 @@ Script.setUsageMessage( '\n'.join( [ __doc__.split( '\n' )[1],
                                      '  Comment:  Reason of the action' ] ) )
 Script.parseCommandLine( ignoreErrors = True )
 
-from DIRAC.Interfaces.API.DiracAdmin import DiracAdmin
-from DIRAC import gConfig
+from DIRAC.Interfaces.API.DiracAdmin                     import DiracAdmin
+from DIRAC.ConfigurationSystem.Client.Helpers.Operations import Operations
+from DIRAC                                               import exit as DIRACExit, gConfig, gLogger
 
-import time, string
+import time
 
 def getBoolean( value ):
   if value.lower() == 'true':
@@ -46,12 +47,11 @@ if len( args ) < 2:
 diracAdmin = DiracAdmin()
 exitCode = 0
 errorList = []
-address = gConfig.getValue( '/Operations/EMail/Production', '' )
 setup = gConfig.getValue( '/DIRAC/Setup', '' )
-if not address or not setup:
+if not setup:
   print 'ERROR: Could not contact Configuration Service'
   exitCode = 2
-  DIRAC.exit( exitCode )
+  DIRACExit( exitCode )
 
 site = args[0]
 comment = args[1]
@@ -65,17 +65,22 @@ else:
     if not userName['OK']:
       print 'ERROR: Could not obtain current username from proxy'
       exitCode = 2
-      DIRAC.exit( exitCode )
+      DIRACExit( exitCode )
     userName = userName['Value']
     subject = '%s is banned for %s setup' % ( site, setup )
     body = 'Site %s is removed from site mask for %s setup by %s on %s.\n\n' % ( site, setup, userName, time.asctime() )
     body += 'Comment:\n%s' % comment
 
-    result = diracAdmin.sendMail( address, subject, body )
+    addressPath = 'EMail/Production'
+    address = Operations().getValue( addressPath, '' )
+    if not address:
+      gLogger.notice( "'%s' not defined in Operations, can not send Mail\n" % addressPath, body )
+    else:
+      result = diracAdmin.sendMail( address, subject, body )
   else:
     print 'Automatic email disabled by flag.'
 
 for error in errorList:
   print "ERROR %s: %s" % error
 
-DIRAC.exit( exitCode )
+DIRACExit( exitCode )

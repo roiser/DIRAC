@@ -65,20 +65,33 @@ gDefaultPerms = stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat
 import DIRAC
 from DIRAC import rootPath
 from DIRAC import gLogger
-from DIRAC import systemCall
 from DIRAC import S_OK, S_ERROR
 
 from DIRAC.Core.Utilities.CFG import CFG
 from DIRAC.Core.Utilities.Version import getVersion
+from DIRAC.Core.Utilities.Subprocess import systemCall
 from DIRAC.ConfigurationSystem.Client.CSAPI import CSAPI
-from DIRAC.ConfigurationSystem.Client.Helpers import cfgPath, cfgPathToList, cfgInstallPath, cfgInstallSection, ResourcesDefaults
-from DIRAC.Core.Security.Properties import *
+from DIRAC.ConfigurationSystem.Client.Helpers import cfgPath, cfgPathToList, cfgInstallPath, \
+                                                     cfgInstallSection, ResourcesDefaults, CSGlobals
+from DIRAC.Core.Security.Properties import ALARMS_MANAGEMENT, SERVICE_ADMINISTRATOR, \
+                                           CS_ADMINISTRATOR, JOB_ADMINISTRATOR, \
+                                           FULL_DELEGATION, PROXY_MANAGEMENT, OPERATOR, \
+                                           NORMAL_USER, TRUSTED_HOST
+
+from DIRAC.ConfigurationSystem.Client import PathFinder
+from DIRAC.Core.Base.private.ModuleLoader import ModuleLoader
+from DIRAC.Core.Base.AgentModule import AgentModule
+from DIRAC.Core.Base.ExecutorModule import ExecutorModule
+from DIRAC.Core.DISET.RequestHandler import RequestHandler
+from DIRAC.Core.Utilities.PrettyPrint import printTable
+from DIRAC.Core.Utilities.Platform import getPlatformString
+
 
 # On command line tools this can be set to True to abort after the first error.
 exitOnError = False
 
 # First some global defaults
-gLogger.notice( 'DIRAC Root Path =', rootPath )
+gLogger.debug( 'DIRAC Root Path =', rootPath )
 
 def loadDiracCfg( verbose = False ):
   """
@@ -87,7 +100,8 @@ def loadDiracCfg( verbose = False ):
   global localCfg, cfgFile, setup, instance, logLevel, linkedRootPath, host
   global basePath, instancePath, runitDir, startDir
   global db, mysqlDir, mysqlDbDir, mysqlLogDir, mysqlMyOrg, mysqlMyCnf, mysqlStartupScript
-  global mysqlRootPwd, mysqlUser, mysqlPassword, mysqlHost, mysqlMode, mysqlSmallMem, mysqlLargeMem
+  global mysqlRootPwd, mysqlUser, mysqlPassword, mysqlHost, mysqlMode
+  global mysqlSmallMem, mysqlLargeMem, mysqlPort, mysqlRootUser
 
   from DIRAC.Core.Utilities.Network import getFQDN
 
@@ -154,7 +168,7 @@ def loadDiracCfg( verbose = False ):
 
   mysqlPassword = localCfg.getOption( cfgInstallPath( 'Database', 'Password' ), mysqlPassword )
   if verbose and mysqlPassword:
-    gLogger.notice( 'Reading %s MySQL Password from local configuration' % mysqlUser )
+    gLogger.notice( 'Reading %s MySQL Password from local configuration ' % mysqlUser )
 
   mysqlHost = localCfg.getOption( cfgInstallPath( 'Database', 'Host' ), '' )
   if mysqlHost:
@@ -163,6 +177,22 @@ def loadDiracCfg( verbose = False ):
   else:
     # if it is not defined use the same as for dirac services
     mysqlHost = host
+
+  mysqlPort = localCfg.getOption( cfgInstallPath( 'Database', 'Port' ), 0 )
+  if mysqlPort:
+    if verbose:
+      gLogger.notice( 'Using MySQL Port from local configuration ', mysqlPort )
+  else:
+    # if it is not defined use the same as for dirac services
+    mysqlPort = 3306
+
+  mysqlRootUser = localCfg.getOption( cfgInstallPath( 'Database', 'RootUser' ), '' )
+  if mysqlRootUser:
+    if verbose:
+      gLogger.notice( 'Using MySQL root user from local configuration ', mysqlRootUser )
+  else:
+    # if it is not defined use root
+    mysqlRootUser = 'root'
 
   mysqlMode = localCfg.getOption( cfgInstallPath( 'Database', 'MySQLMode' ), '' )
   if verbose and mysqlMode:
@@ -200,6 +230,8 @@ mysqlMyCnf = ''
 mysqlStartupScript = ''
 mysqlUser = ''
 mysqlHost = ''
+mysqlPort = ''
+mysqlRootUser = ''
 mysqlSmallMem = ''
 mysqlLargeMem = ''
 loadDiracCfg()
@@ -259,7 +291,8 @@ def _addCfgToCS( cfg ):
   result = cfgClient.mergeFromCFG( cfg )
   if not result['OK']:
     return result
-  return cfgClient.commit()
+  result = cfgClient.commit()
+  return result
 
 def _addCfgToLocalCS( cfg ):
   """
@@ -285,7 +318,7 @@ def _addCfgToLocalCS( cfg ):
 
 def _getCentralCfg( installCfg ):
   """
-  Create the esqueleton of central Cfg for an initial Master CS
+  Create the skeleton of central Cfg for an initial Master CS
   """
   # First copy over from installation cfg
   centralCfg = CFG()
@@ -303,9 +336,8 @@ def _getCentralCfg( installCfg ):
     centralCfg['DIRAC'].addKey( 'VirtualOrganization', vo, '' )
 
   for section in [ 'Systems', 'Resources',
-                   'Resources/Sites', 'Resources/Sites/DIRAC',
-                   'Resources/Sites/LCG', 'Operations',
-                   'Website', 'Registry' ]:
+                   'Resources/Sites', 'Resources/Domains',
+                   'Operations', 'Website', 'Registry' ]:
     if installCfg.isSection( section ):
       centralCfg.createNewSection( section, contents = installCfg[section] )
 
@@ -394,9 +426,9 @@ def _getCentralCfg( installCfg ):
 
   # Operations
   if adminUserEmail:
-    operationsCfg = __getCfg( cfgPath( 'Operations', 'EMail' ), 'Production', adminUserEmail )
+    operationsCfg = __getCfg( cfgPath( 'Operations', 'Defaults', 'EMail' ), 'Production', adminUserEmail )
     centralCfg = centralCfg.mergeWith( operationsCfg )
-    operationsCfg = __getCfg( cfgPath( 'Operations', 'EMail' ), 'Logging', adminUserEmail )
+    operationsCfg = __getCfg( cfgPath( 'Operations', 'Defaults', 'EMail' ), 'Logging', adminUserEmail )
     centralCfg = centralCfg.mergeWith( operationsCfg )
 
   # Website
@@ -464,7 +496,9 @@ def addOptionToDiracCfg( option, value ):
   return S_ERROR( 'Could not merge %s=%s with local configuration' % ( option, value ) )
 
 def addDefaultOptionsToCS( gConfig, componentType, systemName,
-                           component, extensions, mySetup = setup, overwrite = False ):
+                           component, extensions, mySetup = setup,
+                           specialOptions = {}, overwrite = False,
+                           addDefaultOptions = True ):
   """ Add the section with the component options to the CS
   """
   system = systemName.replace( 'System', '' )
@@ -479,11 +513,13 @@ def addDefaultOptionsToCS( gConfig, componentType, systemName,
   sectionName = "Agents"
   if componentType == 'service':
     sectionName = "Services"
+  elif componentType == 'executor':
+    sectionName = "Executors"
 
   # Check if the component CS options exist
   addOptions = True
+  componentSection = cfgPath( 'Systems', system, compInstance, sectionName, component )
   if not overwrite:
-    componentSection = cfgPath( 'Systems', system, compInstance, sectionName, component )
     if gConfig:
       result = gConfig.getOptions( componentSection )
       if result['OK']:
@@ -492,16 +528,23 @@ def addDefaultOptionsToCS( gConfig, componentType, systemName,
   if not addOptions:
     return S_OK( 'Component options already exist' )
 
-  # Add the component options now
-  # print "AT >>>", componentType, system, component, compInstance, extensions
-  result = getComponentCfg( componentType, system, component, compInstance, extensions )
-  # print result
+  # Add the component options now  
+  result = getComponentCfg( componentType, system, component, compInstance, extensions, specialOptions, addDefaultOptions )
   if not result['OK']:
     return result
   compCfg = result['Value']
 
-  gLogger.notice( 'Adding to CS', '%s/%s' % ( system, component ) )
-  return _addCfgToCS( compCfg )
+  gLogger.notice( 'Adding to CS', '%s %s/%s' % ( componentType, system, component ) )
+  resultAddToCFG = _addCfgToCS( compCfg )
+  if componentType == 'executor':
+    # Is it a container ?        
+    execList = compCfg.getOption( '%s/Load' % componentSection, [] )
+    for element in execList:
+      result = addDefaultOptionsToCS( gConfig, componentType, systemName, element, extensions, setup,
+                                      {}, overwrite )
+      resultAddToCFG.setdefault( 'Modules', {} )
+      resultAddToCFG['Modules'][element] = result['OK']
+  return resultAddToCFG
 
 def addDefaultOptionsToComponentCfg( componentType, systemName, component, extensions ):
   """
@@ -551,49 +594,54 @@ def addCfgToComponentCfg( componentType, systemName, component, cfg ):
   gLogger.error( error )
   return S_ERROR( error )
 
-def getComponentCfg( componentType, system, component, compInstance, extensions ):
+def getComponentCfg( componentType, system, component, compInstance, extensions,
+                     specialOptions = {}, addDefaultOptions = True ):
   """
   Get the CFG object of the component configuration
   """
   sectionName = 'Services'
   if componentType == 'agent':
     sectionName = 'Agents'
+  if componentType == 'executor':
+    sectionName = 'Executors'
 
-  extensionsDIRAC = [ x + 'DIRAC' for x in extensions ] + extensions
+  componentModule = component
+  if "Module" in specialOptions:
+    componentModule = specialOptions['Module']
 
-  compCfg = None
-  for ext in extensionsDIRAC + ['DIRAC']:
-    cfgTemplatePath = os.path.join( rootPath, ext, '%sSystem' % system, 'ConfigTemplate.cfg' )
-    if os.path.exists( cfgTemplatePath ):
-      gLogger.notice( 'Loading configuration template', cfgTemplatePath )
-      # Look up the component in this template
-      loadCfg = CFG()
-      loadCfg.loadFromFile( cfgTemplatePath )
+  compCfg = CFG()
 
-      try:
-        compCfg = loadCfg[sectionName][component]
-        # section found
-        break
-      except Exception:
-        error = 'Can not find %s in template' % cfgPath( sectionName, component )
-        gLogger.error( error )
-        if exitOnError:
-          DIRAC.exit( -1 )
-        return S_ERROR( error )
+  if addDefaultOptions:
+    extensionsDIRAC = [ x + 'DIRAC' for x in extensions ] + extensions
+    for ext in extensionsDIRAC + ['DIRAC']:
+      cfgTemplatePath = os.path.join( rootPath, ext, '%sSystem' % system, 'ConfigTemplate.cfg' )
+      if os.path.exists( cfgTemplatePath ):
+        gLogger.notice( 'Loading configuration template', cfgTemplatePath )
+        # Look up the component in this template
+        loadCfg = CFG()
+        loadCfg.loadFromFile( cfgTemplatePath )
+        compCfg = loadCfg.mergeWith( compCfg )
 
-  if not compCfg:
-    error = 'Configuration template not found'
-    gLogger.error( error )
-    if exitOnError:
-      DIRAC.exit( -1 )
-    return S_ERROR( error )
 
-  # Delete Dependencies section if any
-  compCfg.deleteKey( 'Dependencies' )
+    compPath = cfgPath( sectionName, componentModule )
+    if not compCfg.isSection( compPath ):
+      error = 'Can not find %s in template' % compPath
+      gLogger.error( error )
+      if exitOnError:
+        DIRAC.exit( -1 )
+      return S_ERROR( error )
+
+    compCfg = compCfg[sectionName][componentModule]
+
+    # Delete Dependencies section if any
+    compCfg.deleteKey( 'Dependencies' )
 
   sectionPath = cfgPath( 'Systems', system, compInstance, sectionName )
   cfg = __getCfg( sectionPath )
   cfg.createNewSection( cfgPath( sectionPath, component ), '', compCfg )
+
+  for option, value in specialOptions.items():
+    cfg.setOption( cfgPath( sectionPath, component, option ), value )
 
   # Add the service URL
   if componentType == "service":
@@ -666,50 +714,66 @@ def printStartupStatus( rDict ):
   Print in nice format the return dictionary from getStartupComponentStatus 
   (also returned by runsvctrlComponent)
   """
+  fields = ['Name','Runit','Uptime','PID']
+  records = []
   try:
-    print 'Name'.rjust( 32 ), ':', 'Runit    Uptime    PID'
     for comp in rDict:
-      print comp.rjust( 32 ), ':', rDict[comp]['RunitStatus'].ljust( 7 ), rDict[comp]['Timeup'].rjust( 7 ), rDict[comp]['PID'].rjust( 8 )
-  except Exception:
-    pass
+      records.append( [comp, rDict[comp]['RunitStatus'], rDict[comp]['Timeup'], rDict[comp]['PID'] ] )
+    printTable( fields, records )
+  except Exception, x:
+    print "Exception while gathering data for printing: %s" % str( x )
   return S_OK()
 
 def printOverallStatus( rDict ):
   """
   Print in nice format the return dictionary from getOverallStatus
   """
+  fields = ['System','Name','Type','Setup','Installed','Runit','Uptime','PID']
+  records = []
   try:
-    print
-    print "   System", ' '*20, 'Name', ' '*5, 'Type', ' '*23, 'Setup    Installed   Runit    Uptime    PID'
-    print '-' * 116
     for compType in rDict:
       for system in rDict[compType]:
         for component in rDict[compType][system]:
-          print  system.ljust( 28 ), component.ljust( 28 ), compType.lower()[:-1].ljust( 7 ),
+          record = [ system, component, compType.lower()[:-1] ]
           if rDict[compType][system][component]['Setup']:
-            print 'SetUp'.rjust( 12 ),
+            record.append( 'SetUp' )
           else:
-            print 'NotSetup'.rjust( 12 ),
+            record.append( 'NotSetUp' )
           if rDict[compType][system][component]['Installed']:
-            print 'Installed'.rjust( 12 ),
+            record.append( 'Installed' )
           else:
-            print 'NotInstalled'.rjust( 12 ),
-          print str( rDict[compType][system][component]['RunitStatus'] ).ljust( 7 ),
-          print str( rDict[compType][system][component]['Timeup'] ).rjust( 7 ),
-          print str( rDict[compType][system][component]['PID'] ).rjust( 8 ),
-          print
-  except Exception:
-    pass
+            record.append( 'NotInstalled' )
+          record.append( str( rDict[compType][system][component]['RunitStatus'] ) )
+          record.append( str( rDict[compType][system][component]['Timeup'] ) )
+          record.append( str( rDict[compType][system][component]['PID'] ) ) 
+          records.append( record )
+    printTable( fields, records )
+  except Exception, x:
+    print "Exception while gathering data for printing: %s" % str( x )
 
   return S_OK()
+
+def getAvailableSystems( extensions ):
+  """ Get the list of all systems (in all given extensions) locally available
+  """
+  systems = []
+
+  for extension in extensions:
+    extensionPath = os.path.join( DIRAC.rootPath, extension, '*System' )
+    for system in [ os.path.basename( k ).split( 'System' )[0] for k in glob.glob( extensionPath ) ]:
+      if system not in systems:
+        systems.append( system )
+
+  return systems
 
 def getSoftwareComponents( extensions ):
   """  Get the list of all the components ( services and agents ) for which the software
        is installed on the system
   """
-
-  services = {}
+  # The Gateway does not need a handler 
+  services = { 'Framework' : ['Gateway'] }
   agents = {}
+  executors = {}
 
   for extension in ['DIRAC'] + [ x + 'DIRAC' for x in extensions]:
     if not os.path.exists( os.path.join( rootPath, extension ) ):
@@ -745,10 +809,26 @@ def getSoftwareComponents( extensions ):
             services[system].append( service.replace( '.py', '' ).replace( 'Handler', '' ) )
       except OSError:
         pass
+      try:
+        executorDir = os.path.join( rootPath, extension, sys, 'Executor' )
+        executorList = os.listdir( executorDir )
+        for executor in executorList:
+          if executor[-3:] == ".py":
+            executorFile = os.path.join( executorDir, executor )
+            afile = open( executorFile, 'r' )
+            body = afile.read()
+            afile.close()
+            if body.find( 'OptimizerExecutor' ) != -1:
+              if not executors.has_key( system ):
+                executors[system] = []
+              executors[system].append( executor.replace( '.py', '' ) )
+      except OSError:
+        pass
 
   resultDict = {}
   resultDict['Services'] = services
   resultDict['Agents'] = agents
+  resultDict['Executors'] = executors
   return S_OK( resultDict )
 
 def getInstalledComponents():
@@ -759,6 +839,7 @@ def getInstalledComponents():
 
   services = {}
   agents = {}
+  executors = {}
   systemList = os.listdir( runitDir )
   for system in systemList:
     systemDir = os.path.join( runitDir, system )
@@ -777,12 +858,17 @@ def getInstalledComponents():
           if not agents.has_key( system ):
             agents[system] = []
           agents[system].append( component )
+        elif body.find( 'dirac-executor' ) != -1:
+          if not executors.has_key( system ):
+            executors[system] = []
+          executors[system].append( component )
       except IOError:
         pass
 
   resultDict = {}
   resultDict['Services'] = services
   resultDict['Agents'] = agents
+  resultDict['Executors'] = executors
   return S_OK( resultDict )
 
 def getSetupComponents():
@@ -792,6 +878,7 @@ def getSetupComponents():
 
   services = {}
   agents = {}
+  executors = {}
   if not os.path.isdir( startDir ):
     return S_ERROR( 'Startup Directory does not exit: %s' % startDir )
   componentList = os.listdir( startDir )
@@ -802,21 +889,27 @@ def getSetupComponents():
       body = rfile.read()
       rfile.close()
       if body.find( 'dirac-service' ) != -1:
-        system, service = component.split( '_' )
+        system, service = component.split( '_' )[0:2]
         if not services.has_key( system ):
           services[system] = []
         services[system].append( service )
       elif body.find( 'dirac-agent' ) != -1:
-        system, agent = component.split( '_' )
+        system, agent = component.split( '_' )[0:2]
         if not agents.has_key( system ):
           agents[system] = []
         agents[system].append( agent )
+      elif body.find( 'dirac-executor' ) != -1:
+        system, executor = component.split( '_' )[0:2]
+        if not executors.has_key( system ):
+          executors[system] = []
+        executors[system].append( executor )
     except IOError:
       pass
 
   resultDict = {}
   resultDict['Services'] = services
   resultDict['Agents'] = agents
+  resultDict['Executors'] = executors
   return S_OK( resultDict )
 
 def getStartupComponentStatus( componentTupleList ):
@@ -885,6 +978,18 @@ def getStartupComponentStatus( componentTupleList ):
 
   return S_OK( componentDict )
 
+def getComponentModule( gConfig, system, component, compType ):
+  """ Get the component software module
+  """
+  setup = CSGlobals.getSetup()
+  instance = gConfig.getValue( cfgPath( 'DIRAC', 'Setups', setup, system ), '' )
+  if not instance:
+    return S_OK( component )
+  module = gConfig.getValue( cfgPath( 'Systems', system, instance, compType, component, 'Module' ), '' )
+  if not module:
+    module = component
+  return S_OK( module )
+
 def getOverallStatus( extensions ):
   """  Get the list of all the components ( services and agents ) 
        set up for running with runsvdir in startup directory 
@@ -911,8 +1016,8 @@ def getOverallStatus( extensions ):
   runitDict = result['Value']
 
   # Collect the info now
-  resultDict = {'Services':{}, 'Agents':{}}
-  for compType in ['Services', 'Agents']:
+  resultDict = {'Services':{}, 'Agents':{}, 'Executors':{} }
+  for compType in ['Services', 'Agents', 'Executors' ]:
     if softDict.has_key( 'Services' ):
       for system in softDict[compType]:
         resultDict[compType][system] = {}
@@ -947,7 +1052,53 @@ def getOverallStatus( extensions ):
             #print str(x)
             pass
 
+    # Installed components can be not the same as in the software list
+    if installedDict.has_key( 'Services' ):
+      for system in installedDict[compType]:
+        for component in installedDict[compType][system]:
+          if compType in resultDict:
+            if system in resultDict[compType]:
+              if component in resultDict[compType][system]:
+                continue
+          resultDict[compType][system][component] = {}
+          resultDict[compType][system][component]['Setup'] = False
+          resultDict[compType][system][component]['Installed'] = True
+          resultDict[compType][system][component]['RunitStatus'] = 'Unknown'
+          resultDict[compType][system][component]['Timeup'] = 0
+          resultDict[compType][system][component]['PID'] = 0
+          # TODO: why do we need a try here?
+          try:
+            if component in setupDict[compType][system]:
+              resultDict[compType][system][component]['Setup'] = True
+          except Exception:
+            pass
+          try:
+            compDir = system + '_' + component
+            if runitDict.has_key( compDir ):
+              resultDict[compType][system][component]['RunitStatus'] = runitDict[compDir]['RunitStatus']
+              resultDict[compType][system][component]['Timeup'] = runitDict[compDir]['Timeup']
+              resultDict[compType][system][component]['PID'] = runitDict[compDir]['PID']
+          except Exception, x:
+            #print str(x)
+            pass
+
   return S_OK( resultDict )
+
+def checkComponentModule( componentType, system, module ):
+  """ Check existence of the given module
+      and if it inherits from the proper class
+  """
+  if componentType == 'agent':
+    loader = ModuleLoader( "Agent", PathFinder.getAgentSection, AgentModule )
+  elif componentType == 'service':
+    loader = ModuleLoader( "Service", PathFinder.getServiceSection,
+                                      RequestHandler, moduleSuffix = "Handler" )
+  elif componentType == 'executor':
+    loader = ModuleLoader( "Executor", PathFinder.getExecutorSection, ExecutorModule )
+  else:
+    return S_ERROR( 'Unknown component type %s' % componentType )
+
+  return loader.loadModule( "%s/%s" % ( system, module ) )
 
 def checkComponentSoftware( componentType, system, component, extensions ):
   """ Check the component software
@@ -976,6 +1127,13 @@ def runsvctrlComponent( system, component, mode ):
     return S_ERROR( 'Unknown runsvctrl mode "%s"' % mode )
 
   startCompDirs = glob.glob( os.path.join( startDir, '%s_%s' % ( system, component ) ) )
+  # Make sure that the Configuration server restarts first and the SystemAdmin restarts last
+  tmpList = list( startCompDirs )
+  for comp in tmpList:
+    if "Framework_SystemAdministrator" in comp:
+      startCompDirs.append( startCompDirs.pop( startCompDirs.index( comp ) ) )
+    if "Configuration_Server" in comp:
+      startCompDirs.insert( 0, startCompDirs.pop( startCompDirs.index( comp ) ) )
   startCompList = [ [k] for k in startCompDirs]
   for startComp in startCompList:
     result = execCommand( 0, ['runsvctrl', mode] + startComp )
@@ -1052,6 +1210,7 @@ def setupSite( scriptCfg, cfg = None ):
   setupDatabases = localCfg.getOption( cfgInstallPath( 'Databases' ), [] )
   setupServices = [ k.split( '/' ) for k in localCfg.getOption( cfgInstallPath( 'Services' ), [] ) ]
   setupAgents = [ k.split( '/' ) for k in localCfg.getOption( cfgInstallPath( 'Agents' ), [] ) ]
+  setupExecutors = [ k.split( '/' ) for k in localCfg.getOption( cfgInstallPath( 'Executors' ), [] ) ]
   setupWeb = localCfg.getOption( cfgInstallPath( 'WebPortal' ), False )
   setupConfigurationMaster = localCfg.getOption( cfgInstallPath( 'ConfigurationMaster' ), False )
   setupPrivateConfiguration = localCfg.getOption( cfgInstallPath( 'PrivateConfiguration' ), False )
@@ -1076,7 +1235,7 @@ def setupSite( scriptCfg, cfg = None ):
   for agentTuple in setupAgents:
     error = ''
     if len( agentTuple ) != 2:
-      error = 'Wrong agent specification: system/service'
+      error = 'Wrong agent specification: system/agent'
     # elif agentTuple[0] not in setupSystems:
     #   error = 'System %s not available' % agentTuple[0]
     if error:
@@ -1087,6 +1246,19 @@ def setupSite( scriptCfg, cfg = None ):
     agentSysInstance = agentTuple[0]
     if not agentSysInstance in setupSystems:
       setupSystems.append( agentSysInstance )
+
+  for executorTuple in setupExecutors:
+    error = ''
+    if len( executorTuple ) != 2:
+      error = 'Wrong executor specification: system/executor'
+    if error:
+      if exitOnError:
+        gLogger.error( error )
+        DIRAC.exit( -1 )
+      return S_ERROR( error )
+    executorSysInstance = executorTuple[0]
+    if not executorSysInstance in setupSystems:
+      setupSystems.append( executorSysInstance )
 
   # And to find out the available extensions
   result = getExtensions()
@@ -1132,7 +1304,7 @@ def setupSite( scriptCfg, cfg = None ):
       return S_ERROR( error )
 
   # if any server or agent needs to be install we need the startup directory and runsvdir running
-  if setupServices or setupAgents or setupWeb:
+  if setupServices or setupAgents or setupExecutors or setupWeb:
     if not os.path.exists( startDir ):
       try:
         os.makedirs( startDir )
@@ -1161,26 +1333,40 @@ def setupSite( scriptCfg, cfg = None ):
 
   if ['Configuration', 'Server'] in setupServices and setupConfigurationMaster:
     # This server hosts the Master of the CS
+    from DIRAC.ConfigurationSystem.Client.ConfigurationData import gConfigurationData
     gLogger.notice( 'Installing Master Configuration Server' )
     cfg = __getCfg( cfgPath( 'DIRAC', 'Setups', setup ), 'Configuration', instance )
     _addCfgToDiracCfg( cfg )
     cfg = __getCfg( cfgPath( 'DIRAC', 'Configuration' ), 'Master' , 'yes' )
     cfg.setOption( cfgPath( 'DIRAC', 'Configuration', 'Name' ) , setupConfigurationName )
+
     serversCfgPath = cfgPath( 'DIRAC', 'Configuration', 'Servers' )
     if not localCfg.getOption( serversCfgPath , [] ):
       serverUrl = 'dips://%s:9135/Configuration/Server' % host
       cfg.setOption( serversCfgPath, serverUrl )
-      from DIRAC.ConfigurationSystem.Client.ConfigurationData import gConfigurationData
       gConfigurationData.setOptionInCFG( serversCfgPath, serverUrl )
-
+    instanceOptionPath = cfgPath( 'DIRAC', 'Setups', setup )
+    instanceCfg = __getCfg( instanceOptionPath, 'Configuration', instance )
+    cfg = cfg.mergeWith( instanceCfg )
     _addCfgToDiracCfg( cfg )
+
+    result = getComponentCfg( 'service', 'Configuration', 'Server', instance, extensions, addDefaultOptions = True )
+    if not result['OK']:
+      if exitOnError:
+        DIRAC.exit( -1 )
+      else:
+        return result
+    compCfg = result['Value']
+    cfg = cfg.mergeWith( compCfg )
+    gConfigurationData.mergeWithLocal( cfg )
+
     addDefaultOptionsToComponentCfg( 'service', 'Configuration', 'Server', [] )
     if installCfg:
       centralCfg = _getCentralCfg( installCfg )
     else:
       centralCfg = _getCentralCfg( localCfg )
     _addCfgToLocalCS( centralCfg )
-    setupComponent( 'service', 'Configuration', 'Server', [] )
+    setupComponent( 'service', 'Configuration', 'Server', [], checkModule = False )
     runsvctrlComponent( 'Configuration', 'Server', 't' )
 
     while ['Configuration', 'Server'] in setupServices:
@@ -1220,12 +1406,16 @@ def setupSite( scriptCfg, cfg = None ):
       addSystemInstance( system, instance, setup, True )
     for system, service in setupServices:
       if not addDefaultOptionsToCS( None, 'service', system, service, extensions, overwrite = True )['OK']:
-        # If we are not allowed to write to the central CS add the configuration to the local file
+        # If we are not allowed to write to the central CS, add the configuration to the local file
         addDefaultOptionsToComponentCfg( 'service', system, service, extensions )
     for system, agent in setupAgents:
       if not addDefaultOptionsToCS( None, 'agent', system, agent, extensions, overwrite = True )['OK']:
-        # If we are not allowed to write to the central CS add the configuration to the local file
+        # If we are not allowed to write to the central CS, add the configuration to the local file
         addDefaultOptionsToComponentCfg( 'agent', system, agent, extensions )
+    for system, executor in setupExecutors:
+      if not addDefaultOptionsToCS( None, 'executor', system, executor, extensions, overwrite = True )['OK']:
+        # If we are not allowed to write to the central CS, add the configuration to the local file
+        addDefaultOptionsToComponentCfg( 'executor', system, executor, extensions )
   else:
     gLogger.warn( 'Configuration parameters definition is not requested' )
 
@@ -1272,7 +1462,11 @@ def setupSite( scriptCfg, cfg = None ):
   for system, agent in setupAgents:
     setupComponent( 'agent', system, agent, extensions )
 
-  # 6.- And finally the Portal
+  # 6.- Now the executors
+  for system, executor in setupExecutors:
+    setupComponent( 'executor', system, executor, extensions )
+
+  # 7.- And finally the Portal
   if setupWeb:
     setupPortal()
 
@@ -1282,6 +1476,8 @@ def setupSite( scriptCfg, cfg = None ):
       runsvctrlComponent( system, service, 't' )
     for system, agent in setupAgents:
       runsvctrlComponent( system, agent, 't' )
+    for system, executor in setupExecutors:
+      runsvctrlComponent( system, executor, 't' )
 
   return S_OK()
 
@@ -1313,23 +1509,31 @@ exec svlogd .
   os.chmod( logRunFile, gDefaultPerms )
 
 
-def installComponent( componentType, system, component, extensions ):
+def installComponent( componentType, system, component, extensions, componentModule = '', checkModule = True ):
   """ Install runit directory for the specified component
   """
-  # Check that the software for the component is installed
-  if not checkComponentSoftware( componentType, system, component, extensions )['OK']:
-    error = 'Software for %s %s/%s is not installed' % ( componentType, system, component )
-    if exitOnError:
-      gLogger.error( error )
-      DIRAC.exit( -1 )
-    return S_ERROR( error )
-
   # Check if the component is already installed
   runitCompDir = os.path.join( runitDir, system, component )
   if os.path.exists( runitCompDir ):
     msg = "%s %s_%s already installed" % ( componentType, system, component )
     gLogger.notice( msg )
     return S_OK( runitCompDir )
+
+  # Check that the software for the component is installed
+  # Any "Load" or "Module" option in the configuration defining what modules the given "component"
+  # needs to load will be taken care of by checkComponentModule.
+  if checkModule:
+    result = checkComponentModule( componentType, system, component )
+    if not result['OK']:
+    # cModule = componentModule
+    # if not cModule:
+    #   cModule = component
+    # if not checkComponentSoftware( componentType, system, cModule, extensions )['OK'] and componentType != 'executor':
+      error = 'Software for %s %s/%s is not installed' % ( componentType, system, component )
+      if exitOnError:
+        gLogger.error( error )
+        DIRAC.exit( -1 )
+      return S_ERROR( error )
 
   gLogger.notice( 'Installing %s %s/%s' % ( componentType, system, component ) )
 
@@ -1353,14 +1557,12 @@ exec 2>&1
 #
 [ "%(componentType)s" = "agent" ] && renice 20 -p $$
 #
-exec python %(DIRAC)s/DIRAC/Core/scripts/dirac-%(componentType)s.py %(system)s/%(component)s %(componentCfg)s -o LogLevel=%(logLevel)s < /dev/null
+exec python $DIRAC/DIRAC/Core/scripts/dirac-%(componentType)s.py %(system)s/%(component)s %(componentCfg)s < /dev/null
 """ % {'bashrc': os.path.join( instancePath, 'bashrc' ),
-       'DIRAC': linkedRootPath,
        'componentType': componentType,
        'system' : system,
        'component': component,
-       'componentCfg': componentCfg,
-       'logLevel': logLevel } )
+       'componentCfg': componentCfg } )
     fd.close()
 
     os.chmod( runFile, gDefaultPerms )
@@ -1378,11 +1580,11 @@ exec python %(DIRAC)s/DIRAC/Core/scripts/dirac-%(componentType)s.py %(system)s/%
 
   return S_OK( runitCompDir )
 
-def setupComponent( componentType, system, component, extensions ):
+def setupComponent( componentType, system, component, extensions, componentModule = '', checkModule = True ):
   """
   Install and create link in startup
   """
-  result = installComponent( componentType, system, component, extensions )
+  result = installComponent( componentType, system, component, extensions, componentModule, checkModule )
   if not result['OK']:
     return result
 
@@ -1432,7 +1634,12 @@ def uninstallComponent( system, component ):
   """
   Remove startup and runit directories
   """
-  unsetupComponent( system, component )
+
+  result = runsvctrlComponent( system, component, 'd' )
+  if not result['OK']:
+    pass
+
+  result = unsetupComponent( system, component )
 
   for runitCompDir in glob.glob( os.path.join( runitDir, system, component ) ):
     try:
@@ -1588,6 +1795,9 @@ def fixMySQLScripts( startupScript = mysqlStartupScript ):
         line = 'datadir=%s\n' % mysqlDbDir
         gLogger.debug( line )
         line += 'export HOME=%s\n' % mysqlDir
+      if line.find( 'basedir=' ) == 0:
+        platform = getPlatformString()
+        line = 'basedir=%s\n' % os.path.join( rootPath, platform )  
       fd.write( line )
     fd.close()
   except Exception:
@@ -1767,11 +1977,23 @@ def installMySQL():
   result = execCommand( 0, ['mysqladmin', '-u', 'root', 'password', mysqlRootPwd] )
   if not result['OK']:
     return result
+  
+  # MySQL tends to define root@host user rather than root@host.domain
+  hostName = mysqlHost.split('.')[0]
+  result = execMySQL( "UPDATE user SET Host='%s' WHERE Host='%s'" % (mysqlHost,hostName), 
+                                                                     localhost=True )
+  if not result['OK']:
+    return result
+  result = execMySQL( "FLUSH PRIVILEGES" )
+  if not result['OK']:
+    return result
+  
   if mysqlHost and socket.gethostbyname( mysqlHost ) != '127.0.0.1' :
-    result = execCommand( 0, ['mysqladmin', '-u', 'root',
-                              '-h', '%s' % mysqlHost, 'password', mysqlRootPwd] )
+    result = execCommand( 0, ['mysqladmin', '-u', 'root', '-h', mysqlHost, 'password', mysqlRootPwd] )
     if not result['OK']:
       return result
+
+  result = execMySQL( "DELETE from user WHERE Password=''", localhost=True )
 
   if not _addMySQLToDiracCfg():
     return S_ERROR( 'Failed to add MySQL user password to local configuration' )
@@ -1883,12 +2105,12 @@ def installDatabase( dbName ):
           if exitOnError:
             DIRAC.exit( -1 )
           return S_ERROR( error )
-        perms = "SELECT,INSERT,LOCK TABLES,UPDATE,DELETE,CREATE,DROP,ALTER"
-        for cmd in ["GRANT %s ON `%s`.* TO 'Dirac'@'localhost' IDENTIFIED BY '%s'" % ( perms, dbName,
+        perms = "SELECT,INSERT,LOCK TABLES,UPDATE,DELETE,CREATE,DROP,ALTER,CREATE VIEW, SHOW VIEW"
+        for cmd in ["GRANT %s ON `%s`.* TO '%s'@'localhost' IDENTIFIED BY '%s'" % ( perms, dbName, mysqlUser,
                                                                                        mysqlPassword ),
-                    "GRANT %s ON `%s`.* TO 'Dirac'@'%s' IDENTIFIED BY '%s'" % ( perms, dbName,
+                    "GRANT %s ON `%s`.* TO '%s'@'%s' IDENTIFIED BY '%s'" % ( perms, dbName, mysqlUser,
                                                                                 mysqlHost, mysqlPassword ),
-                    "GRANT %s ON `%s`.* TO 'Dirac'@'%%' IDENTIFIED BY '%s'" % ( perms, dbName,
+                    "GRANT %s ON `%s`.* TO '%s'@'%%' IDENTIFIED BY '%s'" % ( perms, dbName, mysqlUser,
                                                                                 mysqlPassword ),
                     ]:
           result = execMySQL( cmd )
@@ -1967,7 +2189,7 @@ def installDatabase( dbName ):
 
   return S_OK( dbFile.split( '/' )[-4:-2] )
 
-def execMySQL( cmd, dbName = 'mysql' ):
+def execMySQL( cmd, dbName = 'mysql', localhost=False ):
   """
   Execute MySQL Command
   """
@@ -1976,7 +2198,10 @@ def execMySQL( cmd, dbName = 'mysql' ):
   if not mysqlRootPwd:
     return S_ERROR( 'MySQL root password is not defined' )
   if dbName not in db:
-    db[dbName] = MySQL( mysqlHost, 'root', mysqlRootPwd, dbName )
+    dbHost = mysqlHost
+    if localhost:
+      dbHost = 'localhost'
+    db[dbName] = MySQL( dbHost, mysqlRootUser, mysqlRootPwd, dbName, mysqlPort )
   if not db[dbName]._connected:
     error = 'Could not connect to MySQL server'
     gLogger.error( error )

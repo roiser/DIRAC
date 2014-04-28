@@ -1,53 +1,49 @@
-########################################################################
-# $Id$
-########################################################################
-""" DIRAC Transformation DB
+''' DIRAC Transformation DB
 
     Transformation database is used to collect and serve the necessary information
     in order to automate the task of job preparation for high level transformations.
     This class is typically used as a base class for more specific data processing
     databases
-"""
+'''
+
+import re, time, threading, copy
+from types import IntType, LongType, StringTypes, ListType, TupleType, DictType
+
+from DIRAC                                                import gLogger, S_OK, S_ERROR
+from DIRAC.Core.Base.DB                                   import DB
+from DIRAC.Resources.Catalog.FileCatalog                  import FileCatalog
+from DIRAC.Core.Security.ProxyInfo                        import getProxyInfo
+from DIRAC.Core.Utilities.List                            import stringListToString, intListToString, sortList, breakListIntoChunks
+from DIRAC.Core.Utilities.Shifter                         import setupShifterProxyInEnv
+from DIRAC.ConfigurationSystem.Client.Helpers.Operations  import Operations
+from DIRAC.Core.Utilities.Subprocess                      import pythonCall
 
 __RCSID__ = "$Id$"
-
-from DIRAC                                                             import gConfig, gLogger, S_OK, S_ERROR
-from DIRAC.Core.Base.DB                                                import DB
-from DIRAC.DataManagementSystem.Client.ReplicaManager                  import CatalogDirectory
-from DIRAC.Core.DISET.RPCClient                                        import RPCClient
-from DIRAC.Core.Security.ProxyInfo                                     import getProxyInfo
-from DIRAC.Core.Utilities.List                                         import stringListToString, intListToString, sortList
-from DIRAC.Core.Utilities.SiteSEMapping                                import getSEsForSite, getSitesForSE
-from DIRAC.Core.Utilities.Shifter                                      import setupShifterProxyInEnv
-from DIRAC.Core.Utilities.Subprocess                                   import pythonCall
-
-from types import *
-import re, time, string, threading, copy
 
 MAX_ERROR_COUNT = 10
 
 #############################################################################
 
 class TransformationDB( DB ):
+  """ TransformationDB class
+  """
 
-  def __init__( self, dbname = None, dbconfig = None, maxQueueSize = 10, dbIn = None, logger = None ):
-    """ The standard constructor takes the database name (dbname) and the name of the
+  def __init__( self, maxQueueSize = 10, dbIn = None ):
+    ''' The standard constructor takes the database name (dbname) and the name of the
         configuration section (dbconfig)
-    """
-
-    if not dbname:
-      dbname = 'TransformationDB'
-    if not dbconfig:
-      dbconfig = 'Transformation/TransformationDB'
+    '''
 
     if not dbIn:
-      DB.__init__( self, dbname, dbconfig, maxQueueSize )
+      DB.__init__( self, 'TransformationDB', 'Transformation/TransformationDB', maxQueueSize )
 
     self.lock = threading.Lock()
-    self.dbname = dbname
+    self.filters = ()
     res = self.__updateFilters()
     if not res['OK']:
       gLogger.fatal( "Failed to create filters" )
+
+    self.allowedStatusForTasks = ( 'Unused', 'ProbInFC' )
+
 
     self.TRANSPARAMS = [  'TransformationID',
                           'TransformationName',
@@ -76,7 +72,7 @@ class TransformationDB( DB ):
                           'AgentType',
                           'Status',
                           'MaxNumberOfTasks',
-                          'TransformationFamily'] # for the moment include TransformationFamily
+                          'TransformationFamily']  # for the moment include TransformationFamily
 
     self.TRANSFILEPARAMS = ['TransformationID',
                             'FileID',
@@ -100,31 +96,234 @@ class TransformationDB( DB ):
                           'CreationTime',
                           'LastUpdateTime']
 
+    self.ADDITIONALPARAMETERS = ['TransformationID',
+                                 'ParameterName',
+                                 'ParameterValue',
+                                 'ParameterType'
+                                 ]
+
+    default_task_statuses = ['Created', 'Submitted', 'Checking', 'Staging', 'Waiting', 'Running',
+                             'Done', 'Completed', 'Killed', 'Stalled', 'Failed', 'Rescheduled']
+    default_file_statuses = ['Unused', 'Assigned', 'Processed', 'Problematic']
+    self.tasksStatuses = default_task_statuses + Operations().getValue( 'Transformations/TasksStates', [] )
+    self.fileStatuses = default_file_statuses + Operations().getValue( 'Transformations/FilesStatuses', [] )
+
+    result = self.__initializeDB()
+    if not result[ 'OK' ]:
+      self.log.fatal( "Cannot initialize TransformationDB!", result[ 'Message' ] )
+
+  def _generateTables( self ):
+    """ _generateTables
+    
+    Method that returns a dictionary with all the tables to be created. It also
+    makes easier its extension by DIRAC plugins.
+    """
+    
+    retVal = self._query( "SHOW tables" )
+    if not retVal[ 'OK' ]:
+      return retVal
+
+    tablesInDB = [ t[0] for t in retVal[ 'Value' ] ]
+    tablesD = {}
+
+    if 'AdditionalParameters' not in tablesInDB:
+      tablesD[ 'AdditionalParameters' ] = {'Fields': {'ParameterName': 'VARCHAR(32) NOT NULL',
+                                                      'ParameterType': "VARCHAR(32) DEFAULT 'StringType'",
+                                                      'ParameterValue': 'LONGBLOB NOT NULL',
+                                                      'TransformationID': 'INTEGER NOT NULL'},
+                                           'PrimaryKey': ['TransformationID', 'ParameterName'],
+                                           'Engine': 'InnoDB'
+                                           }
+
+    if 'DataFiles' not in tablesInDB:
+      tablesD['DataFiles'] = {'Fields': {'FileID': 'INTEGER NOT NULL AUTO_INCREMENT',
+                                         'LFN': 'VARCHAR(255) UNIQUE',
+                                         'Status': "VARCHAR(32) DEFAULT 'AprioriGood'"},
+                              'Indexes': {'Status': ['Status']},
+                              'PrimaryKey': ['FileID'],
+                              'Engine': 'InnoDB'
+                              }
+
+    if 'Replicas' not in tablesInDB:
+      tablesD['Replicas'] = {'Fields': {'FileID': 'INTEGER NOT NULL',
+                                        'PFN': 'VARCHAR(255)',
+                                        'SE': 'VARCHAR(32)',
+                                        'Status': "VARCHAR(32) DEFAULT 'AprioriGood'"},
+                             'Indexes': {'Status': ['Status']},
+                             'PrimaryKey': ['FileID', 'SE'],
+                             'Engine': 'InnoDB'
+                             }
+
+    if 'TaskInputs' not in tablesInDB:
+      tablesD['TaskInputs'] = {'Fields': {'InputVector': 'BLOB',
+                                          'TaskID': 'INTEGER NOT NULL',
+                                          'TransformationID': 'INTEGER NOT NULL'},
+                               'PrimaryKey': ['TransformationID', 'TaskID'],
+                               'Engine': 'InnoDB'
+                               }
+
+    if 'TransformationFileTasks' not in tablesInDB:
+      tablesD['TransformationFileTasks'] = {'Fields': {'FileID': 'INTEGER NOT NULL',
+                                                       'TaskID': 'INTEGER NOT NULL',
+                                                       'TransformationID': 'INTEGER NOT NULL'},
+                                            'PrimaryKey': ['TransformationID', 'FileID', 'TaskID'],
+                                            'Engine': 'InnoDB'
+                                            }
+
+    if 'TransformationFiles' not in tablesInDB:
+      tablesD['TransformationFiles'] = {'Fields': { 'TransformationID': 'INTEGER NOT NULL',
+                                                    'FileID': 'INTEGER NOT NULL',
+                                                    'TaskID': 'INTEGER',
+                                                    'ErrorCount': 'INT(4) NOT NULL DEFAULT 0',
+                                                    'InsertedTime': 'DATETIME',
+                                                    'LastUpdate': 'DATETIME',
+                                                    'Status': 'VARCHAR(32) DEFAULT "Unused"',
+                                                    'TargetSE': 'VARCHAR(255) DEFAULT "Unknown"',
+                                                    'UsedSE': 'VARCHAR(255) DEFAULT "Unknown"'},
+                                         'Indexes': {'Status': ['Status'],
+                                                     'TransformationID': ['TransformationID']},
+                                         'PrimaryKey': ['TransformationID', 'FileID'],
+                                         'Engine': 'InnoDB'
+                                         }
+
+    if 'TransformationInputDataQuery' not in tablesInDB:
+      tablesD['TransformationInputDataQuery'] = {'Fields': {'ParameterName': 'VARCHAR(512) NOT NULL',
+                                                            'ParameterType': 'VARCHAR(8) NOT NULL',
+                                                            'ParameterValue': 'BLOB NOT NULL',
+                                                            'TransformationID': 'INTEGER NOT NULL'},
+                                                 'PrimaryKey': ['TransformationID', 'ParameterName'],
+                                                 'Engine': 'InnoDB'
+                                                 }
+
+    if 'TransformationLog' not in tablesInDB:
+      tablesD['TransformationLog'] = {'Fields': {'Author': 'VARCHAR(255) NOT NULL DEFAULT "Unknown"',
+                                                 'Message': 'VARCHAR(255) NOT NULL',
+                                                 'MessageDate': 'DATETIME NOT NULL',
+                                                 'TransformationID': 'INTEGER NOT NULL'},
+                                      'Indexes': {'MessageDate': ['MessageDate'],
+                                                  'TransformationID': ['TransformationID']},
+                                      'Engine': 'InnoDB'
+                                      }
+
+    if 'TransformationTasks' not in tablesInDB:
+      ## The engine of that table must stay MyISAM, because the addTaskToTransformation needs 
+      # that when inserting a row, the LAST_INSERT_ID returns the last task ID for 
+      # the given transformation. This only works because TaskID is NOT an INDEX
+      # and because the engine is MyISAM.
+      tablesD['TransformationTasks'] = {'Fields': {'CreationTime': 'DATETIME NOT NULL',
+                                                   'ExternalID': "char(16) DEFAULT ''",
+                                                   'ExternalStatus': "char(16) DEFAULT 'Created'",
+                                                   'LastUpdateTime': 'DATETIME NOT NULL',
+                                                   'TargetSE': "char(255) DEFAULT 'Unknown'",
+                                                   'TaskID': 'INTEGER NOT NULL AUTO_INCREMENT',
+                                                   'TransformationID': 'INTEGER NOT NULL'},
+                                        'Indexes': {'ExternalStatus': ['ExternalStatus']},
+                                        'PrimaryKey': ['TransformationID', 'TaskID'],
+                                        'Engine': 'MyISAM'
+                                        },
+    
+    if 'Transformations' not in tablesInDB:
+      tablesD['Transformations'] = {'Fields': {'AgentType': "CHAR(32) DEFAULT 'Manual'",
+                                               'AuthorDN': 'VARCHAR(255) NOT NULL',
+                                               'AuthorGroup': 'VARCHAR(255) NOT NULL',
+                                               'Body': 'LONGBLOB',
+                                               'CreationDate': 'DATETIME',
+                                               'Description': 'VARCHAR(255)',
+                                               'EventsPerTask': 'INT NOT NULL DEFAULT 0',
+                                               'FileMask': 'VARCHAR(255)',
+                                               'GroupSize': 'INT NOT NULL DEFAULT 1',
+                                               'InheritedFrom': 'INTEGER DEFAULT 0',
+                                               'LastUpdate': 'DATETIME',
+                                               'LongDescription': 'BLOB',
+                                               'MaxNumberOfTasks': 'INT NOT NULL DEFAULT 0',
+                                               'Plugin': "CHAR(32) DEFAULT 'None'",
+                                               'Status': "CHAR(32) DEFAULT 'New'",
+                                               'TransformationFamily': "varchar(64) default '0'",
+                                               'TransformationGroup': "varchar(64) NOT NULL default 'General'",
+                                               'TransformationID': 'INTEGER NOT NULL AUTO_INCREMENT',
+                                               'TransformationName': 'VARCHAR(255) NOT NULL',
+                                               'Type': "CHAR(32) DEFAULT 'Simulation'"},
+                                    'Indexes': {'TransformationName': ['TransformationName']},
+                                    'PrimaryKey': ['TransformationID'],
+                                    'Engine': 'InnoDB'
+                                    }
+
+    if 'TransformationCounters' not in tablesInDB:
+      tablesD['TransformationCounters'] = {'Fields': {'TransformationID' : "INTEGER NOT NULL"},
+                                           'PrimaryKey': ['TransformationID'],
+                                           'Engine': 'InnoDB'
+                                           }
+      ##Get from the CS the list of columns names
+      for status in self.tasksStatuses + self.fileStatuses:
+        tablesD['TransformationCounters']['Fields'][status] = 'INTEGER DEFAULT 0'
+        
+    return S_OK( tablesD )        
+
+  def __initializeDB( self ):
+    ''' Initialize: create tables if needed
+    '''
+
+    tablesToBeCreated = self._generateTables()
+    if not tablesToBeCreated[ 'OK' ]:
+      return tablesToBeCreated
+    tablesToBeCreated = tablesToBeCreated[ 'Value' ]
+
+    if tablesToBeCreated:
+      gLogger.verbose( "Creating tables %s" % ( ', '.join( tablesToBeCreated.keys() ) ) )
+      res = self._createTables( tablesToBeCreated )
+      if not res['OK']:
+        return res
+
+    #Get the available counters
+    retVal = self._query( "EXPLAIN TransformationCounters" )
+    if not retVal[ 'OK' ]:
+      return retVal
+    TSCounterFields = [ t[0] for t in retVal[ 'Value' ] ]
+    for status in list( set( self.tasksStatuses + self.fileStatuses ) - set( TSCounterFields ) ):
+      altertable = "ALTER TABLE TransformationCounters ADD COLUMN `%s` INTEGER DEFAULT 0" % status
+      retVal = self._update( altertable )
+      if not retVal['OK']:
+        return retVal
+
+    return S_OK()
+
+    # This is here to ensure full compatibility between different versions of the MySQL DB schema
+    self.isTransformationTasksInnoDB = True
+    res = self._query( "SELECT Engine FROM INFORMATION_SCHEMA.TABLES WHERE table_name = 'TransformationTasks'" )
+    if not res['OK']:
+      raise RuntimeError, res['Message']
+    else:
+      engine = res['Value'][0][0]
+      if engine.lower() != 'innodb':
+        self.isTransformationTasksInnoDB = False
+
   def getName( self ):
     """  Get the database name
     """
-    return self.dbname
+    return self.dbName
 
   ###########################################################################
   #
   # These methods manipulate the Transformations table
   #
 
-  def addTransformation( self, transName, description, longDescription, authorDN, authorGroup, transType, plugin, agentType, fileMask,
-                        transformationGroup = 'General',
-                        groupSize = 1,
-                        inheritedFrom = 0,
-                        body = '',
-                        maxTasks = 0,
-                        eventsPerTask = 0,
-                        addFiles = True,
-                        connection = False ):
-    """ Add new transformation definition including its input streams
-    """
+  def addTransformation( self, transName, description, longDescription, authorDN, authorGroup, transType,
+                         plugin, agentType, fileMask,
+                         transformationGroup = 'General',
+                         groupSize = 1,
+                         inheritedFrom = 0,
+                         body = '',
+                         maxTasks = 0,
+                         eventsPerTask = 0,
+                         addFiles = True,
+                         connection = False ):
+    ''' Add new transformation definition including its input streams
+    '''
     connection = self.__getConnection( connection )
     res = self._getTransformationID( transName, connection = connection )
     if res['OK']:
-      return S_ERROR( "Transformation with name %s already exists with TransformationID = %d" % ( transName, res['Value'] ) )
+      return S_ERROR( "Transformation with name %s already exists with TransformationID = %d" % ( transName,
+                                                                                                  res['Value'] ) )
     elif res['Message'] != "Transformation does not exist":
       return res
     self.lock.acquire()
@@ -157,36 +356,39 @@ class TransformationDB( DB ):
     if inheritedFrom:
       res = self._getTransformationID( inheritedFrom, connection = connection )
       if not res['OK']:
-        gLogger.error( "Failed to get ID for parent transformation", res['Message'] )
-        self.deleteTransformation( transID, connection = connection )
-        return res
+        gLogger.error( "Failed to get ID for parent transformation: %s, now deleting" % res['Message'] )
+        return self.deleteTransformation( transID, connection = connection )
       originalID = res['Value']
-      res = self.setTransformationParameter( originalID, 'Status', 'Completing', author = authorDN, connection = connection )
+      # FIXME: this is not the right place to change status information, and in general the whole should not be here
+      res = self.setTransformationParameter( originalID, 'Status', 'Completing',
+                                             author = authorDN, connection = connection )
       if not res['OK']:
-        gLogger.error( "Failed to update parent transformation status", res['Message'] )
-        self.deleteTransformation( transID, connection = connection )
-        return res
+        gLogger.error( "Failed to update parent transformation status: %s, now deleting" % res['Message'] )
+        return self.deleteTransformation( transID, connection = connection )
       message = 'Creation of the derived transformation (%d)' % transID
       self.__updateTransformationLogging( originalID, message, authorDN, connection = connection )
       res = self.getTransformationFiles( condDict = {'TransformationID':originalID}, connection = connection )
       if not res['OK']:
-        self.deleteTransformation( transID, connection = connection )
-        return res
+        gLogger.error( "Could not get transformation files: %s, now deleting" % res['Message'] )
+        return self.deleteTransformation( transID, connection = connection )
       if res['Records']:
         res = self.__insertExistingTransformationFiles( transID, res['Records'], connection = connection )
         if not res['OK']:
-          self.deleteTransformation( transID, connection = connection )
-          return res
+          gLogger.error( "Could not insert files: %s, now deleting" % res['Message'] )
+          return self.deleteTransformation( transID, connection = connection )
     if addFiles and fileMask:
       self.__addExistingFiles( transID, connection = connection )
     message = "Created transformation %d" % transID
     self.__updateTransformationLogging( transID, message, authorDN, connection = connection )
     return S_OK( transID )
 
-  def getTransformations( self, condDict = {}, older = None, newer = None, timeStamp = 'LastUpdate', orderAttribute = None, limit = None, extraParams = False, connection = False ):
-    """ Get parameters of all the Transformations with support for the web standard structure """
+  def getTransformations( self, condDict = {}, older = None, newer = None, timeStamp = 'LastUpdate',
+                          orderAttribute = None, limit = None, extraParams = False, offset = None, connection = False ):
+    ''' Get parameters of all the Transformations with support for the web standard structure '''
     connection = self.__getConnection( connection )
-    req = "SELECT %s FROM Transformations %s" % ( intListToString( self.TRANSPARAMS ), self.buildCondition( condDict, older, newer, timeStamp, orderAttribute, limit ) )
+    req = "SELECT %s FROM Transformations %s" % ( intListToString( self.TRANSPARAMS ),
+                                                  self.buildCondition( condDict, older, newer, timeStamp,
+                                                                       orderAttribute, limit, offset = offset ) )
     res = self._query( req, connection )
     if not res['OK']:
       return res
@@ -217,14 +419,15 @@ class TransformationDB( DB ):
     return result
 
   def getTransformation( self, transName, extraParams = False, connection = False ):
-    """Get Transformation definition and parameters of Transformation identified by TransformationID
-    """
+    '''Get Transformation definition and parameters of Transformation identified by TransformationID
+    '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
     connection = res['Value']['Connection']
     transID = res['Value']['TransformationID']
-    res = self.getTransformations( condDict = {'TransformationID':transID}, extraParams = extraParams, connection = connection )
+    res = self.getTransformations( condDict = {'TransformationID':transID}, extraParams = extraParams,
+                                   connection = connection )
     if not res['OK']:
       return res
     if not res['Value']:
@@ -232,7 +435,7 @@ class TransformationDB( DB ):
     return S_OK( res['Value'][0] )
 
   def getTransformationParameters( self, transName, parameters, connection = False ):
-    """ Get the requested parameters for a supplied transformation """
+    ''' Get the requested parameters for a supplied transformation '''
     if type( parameters ) in StringTypes:
       parameters = [parameters]
     extraParams = False
@@ -253,30 +456,34 @@ class TransformationDB( DB ):
     return S_OK( paramDict )
 
   def getTransformationWithStatus( self, status, connection = False ):
-    """ Gets a list of the transformations with the supplied status """
+    ''' Gets a list of the transformations with the supplied status '''
     req = "SELECT TransformationID FROM Transformations WHERE Status = '%s';" % status
-    res = self._query( req )
+    res = self._query( req, conn = connection )
     if not res['OK']:
       return res
     transIDs = []
-    for tuple in res['Value']:
-      transIDs.append( tuple[0] )
+    for tupleIn in res['Value']:
+      transIDs.append( tupleIn[0] )
     return S_OK( transIDs )
 
-  def getTableDistinctAttributeValues( self, table, attributes, selectDict, older = None, newer = None, timeStamp = None, connection = False ):
+  def getTableDistinctAttributeValues( self, table, attributes, selectDict, older = None, newer = None,
+                                       timeStamp = None, connection = False ):
     tableFields = { 'Transformations'      : self.TRANSPARAMS,
                     'TransformationTasks'  : self.TASKSPARAMS,
                     'TransformationFiles'  : self.TRANSFILEPARAMS}
     possibleFields = tableFields.get( table, [] )
-    return self.__getTableDistinctAttributeValues( table, possibleFields, attributes, selectDict, older, newer, timeStamp, connection = connection )
+    return self.__getTableDistinctAttributeValues( table, possibleFields, attributes, selectDict, older, newer,
+                                                   timeStamp, connection = connection )
 
-  def __getTableDistinctAttributeValues( self, table, possible, attributes, selectDict, older, newer, timeStamp, connection = False ):
+  def __getTableDistinctAttributeValues( self, table, possible, attributes, selectDict, older, newer,
+                                         timeStamp, connection = False ):
     connection = self.__getConnection( connection )
     attributeValues = {}
     for attribute in attributes:
       if possible and ( not attribute in  possible ):
         return S_ERROR( 'Requested attribute (%s) does not exist in table %s' % ( attribute, table ) )
-      res = self.getDistinctAttributeValues( table, attribute, condDict = selectDict, older = older, newer = newer, timeStamp = timeStamp, connection = connection )
+      res = self.getDistinctAttributeValues( table, attribute, condDict = selectDict, older = older, newer = newer,
+                                             timeStamp = timeStamp, connection = connection )
       if not res['OK']:
         return S_ERROR( 'Failed to serve values for attribute %s in table %s' % ( attribute, table ) )
       attributeValues[attribute] = res['Value']
@@ -285,11 +492,13 @@ class TransformationDB( DB ):
   def __updateTransformationParameter( self, transID, paramName, paramValue, connection = False ):
     if not ( paramName in self.mutable ):
       return S_ERROR( "Can not update the '%s' transformation parameter" % paramName )
-    req = "UPDATE Transformations SET %s='%s', LastUpdate=UTC_TIMESTAMP() WHERE TransformationID=%d" % ( paramName, paramValue, transID )
+    req = "UPDATE Transformations SET %s='%s', LastUpdate=UTC_TIMESTAMP() WHERE TransformationID=%d" % ( paramName,
+                                                                                                          paramValue,
+                                                                                                          transID )
     return self._update( req, connection )
 
   def _getTransformationID( self, transName, connection = False ):
-    """ Method returns ID of transformation with the name=<name> """
+    ''' Method returns ID of transformation with the name=<name> '''
     try:
       transName = long( transName )
       cmd = "SELECT TransformationID from Transformations WHERE TransformationID=%d;" % transName
@@ -311,14 +520,13 @@ class TransformationDB( DB ):
     return self._update( req, connection )
 
   def __updateFilters( self, connection = False ):
-    """ Get filters for all defined input streams in all the transformations.
+    ''' Get filters for all defined input streams in all the transformations.
         If transID argument is given, get filters only for this transformation.
-    """
+    '''
     resultList = []
     # Define the general filter first
     self.database_name = self.__class__.__name__
-    setup = gConfig.getValue( '/DIRAC/Setup', '' )
-    value = gConfig.getValue( '/Operations/InputDataFilter/%s/%sFilter' % ( setup, self.database_name ), '' )
+    value = Operations().getValue( 'InputDataFilter/%sFilter' % self.database_name, '' )
     if value:
       refilter = re.compile( value )
       resultList.append( ( 0, refilter ) )
@@ -335,7 +543,7 @@ class TransformationDB( DB ):
     return S_OK( resultList )
 
   def __filterFile( self, lfn, filters = None ):
-    """Pass the input file through a supplied filter or those currently active """
+    '''Pass the input file through a supplied filter or those currently active '''
     result = []
     if filters:
       for transID, refilter in filters:
@@ -352,7 +560,7 @@ class TransformationDB( DB ):
   # These methods manipulate the AdditionalParameters tables
   #
   def setTransformationParameter( self, transName, paramName, paramValue, author = '', connection = False ):
-    """ Add a parameter for the supplied transformations """
+    ''' Add a parameter for the supplied transformations '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -380,7 +588,7 @@ class TransformationDB( DB ):
     return self.__getAdditionalParameters( transID, connection = connection )
 
   def deleteTransformationParameter( self, transName, paramName, author = '', connection = False ):
-    """ Delete a parameter from the additional parameters table """
+    ''' Delete a parameter from the additional parameters table '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -391,7 +599,8 @@ class TransformationDB( DB ):
     res = self.__deleteTransformationParameters( transID, parameters = [paramName], connection = connection )
     if not res['OK']:
       return res
-    self.__updateTransformationLogging( transID, 'Removed additional parameter %s' % paramName, author, connection = connection )
+    self.__updateTransformationLogging( transID, 'Removed additional parameter %s' % paramName, author,
+                                        connection = connection )
     return res
 
   def __addAdditionalTransformationParameter( self, transID, paramName, paramValue, connection = False ):
@@ -406,16 +615,19 @@ class TransformationDB( DB ):
     paramType = 'StringType'
     if type( paramValue ) in [IntType, LongType]:
       paramType = 'IntType'
-    req = "INSERT INTO AdditionalParameters (TransformationID,ParameterName,ParameterValue,ParameterType) VALUES (%s,'%s',%s,'%s');" % ( transID, paramName, paramValue, paramType )
+    req = "INSERT INTO AdditionalParameters (%s) VALUES (%s,'%s',%s,'%s');" % ( ', '.join( self.ADDITIONALPARAMETERS ),
+                                                                                transID, paramName,
+                                                                                paramValue, paramType )
     return self._update( req, connection )
 
   def __getAdditionalParameters( self, transID, connection = False ):
-    req = "SELECT ParameterName,ParameterValue,ParameterType FROM AdditionalParameters WHERE TransformationID = %d" % transID
+    req = "SELECT %s FROM AdditionalParameters WHERE TransformationID = %d" % ( ', '.join( self.ADDITIONALPARAMETERS ),
+                                                                               transID )
     res = self._query( req, connection )
     if not res['OK']:
       return res
     paramDict = {}
-    for parameterName, parameterValue, parameterType in res['Value']:
+    for transID, parameterName, parameterValue, parameterType in res['Value']:
       parameterType = eval( parameterType )
       if parameterType in [IntType, LongType]:
         parameterValue = int( parameterValue )
@@ -423,7 +635,7 @@ class TransformationDB( DB ):
     return S_OK( paramDict )
 
   def __deleteTransformationParameters( self, transID, parameters = [], connection = False ):
-    """ Remove the parameters associated to a transformation """
+    ''' Remove the parameters associated to a transformation '''
     req = "DELETE FROM AdditionalParameters WHERE TransformationID=%d" % transID
     if parameters:
       req = "%s AND ParameterName IN (%s);" % ( req, stringListToString( parameters ) )
@@ -435,7 +647,7 @@ class TransformationDB( DB ):
   #
 
   def addFilesToTransformation( self, transName, lfns, connection = False ):
-    """ Add a list of LFNs to the transformation directly """
+    ''' Add a list of LFNs to the transformation directly '''
     if not lfns:
       return S_ERROR( 'Zero length LFN list' )
     res = self._getConnectionTransID( connection, transName )
@@ -446,16 +658,16 @@ class TransformationDB( DB ):
     res = self.__getFileIDsForLfns( lfns, connection = connection )
     if not res['OK']:
       return res
-    fileIDs, lfnFilesIDs = res['Value']
+    fileIDs, _lfnFilesIDs = res['Value']
     failed = {}
     successful = {}
     missing = []
     fileIDsValues = set( fileIDs.values() )
     for lfn in lfns:
       if lfn not in fileIDsValues:
-        missing.append( ( lfn, 'Unknown', 'Unknown' ) )
+        missing.append( lfn )
     if missing:
-      res = self.__addFileTuples( missing, connection = connection )
+      res = self.__addDataFiles( missing, connection = connection )
       if not res['OK']:
         return res
       for lfn, fileID in res['Value'].items():
@@ -473,8 +685,9 @@ class TransformationDB( DB ):
     resDict = {'Successful':successful, 'Failed':failed}
     return S_OK( resDict )
 
-  def getTransformationFiles( self, condDict = {}, older = None, newer = None, timeStamp = 'LastUpdate', orderAttribute = None, limit = None, connection = False ):
-    """ Get files for the supplied transformations with support for the web standard structure """
+  def getTransformationFiles( self, condDict = {}, older = None, newer = None, timeStamp = 'LastUpdate',
+                              orderAttribute = None, limit = None, offset = None, connection = False ):
+    ''' Get files for the supplied transformations with support for the web standard structure '''
     connection = self.__getConnection( connection )
     req = "SELECT %s FROM TransformationFiles" % ( intListToString( self.TRANSFILEPARAMS ) )
     originalFileIDs = {}
@@ -486,9 +699,15 @@ class TransformationDB( DB ):
         res = self.__getFileIDsForLfns( lfns, connection = connection )
         if not res['OK']:
           return res
-        originalFileIDs, ignore = res['Value']
+        originalFileIDs, _ignore = res['Value']
         condDict['FileID'] = originalFileIDs.keys()
-      req = "%s %s" % ( req, self.buildCondition( condDict, older, newer, timeStamp, orderAttribute, limit ) )
+
+      for val in condDict.itervalues():
+        if not val:
+          return S_OK( [] )
+
+      req = "%s %s" % ( req, self.buildCondition( condDict, older, newer, timeStamp, orderAttribute, limit,
+                                                  offset = offset ) )
     res = self._query( req, connection )
     if not res['OK']:
       return res
@@ -522,16 +741,16 @@ class TransformationDB( DB ):
         webList.append( rList )
         resultList.append( fDict )
     result = S_OK( resultList )
-    result['LFNs'] = originalFileIDs.values()
+    # result['LFNs'] = originalFileIDs.values()
     result['Records'] = webList
     result['ParameterNames'] = ['LFN'] + self.TRANSFILEPARAMS
     return result
 
   def getFileSummary( self, lfns, connection = False ):
-    """ Get file status summary in all the transformations """
+    ''' Get file status summary in all the transformations '''
     connection = self.__getConnection( connection )
     condDict = {'LFN':lfns}
-    res = self.getTransformationFiles( self, condDict = condDict, connection = connection )
+    res = self.getTransformationFiles( condDict = condDict, connection = connection )
     if not res['OK']:
       return res
     resDict = {}
@@ -549,85 +768,30 @@ class TransformationDB( DB ):
         failedDict[lfn] = 'Did not exist in the Transformation database'
     return S_OK( {'Successful':resDict, 'Failed':failedDict} )
 
-  def setFileUsedSEForTransformation( self, transName, usedSE, lfns, connection = False ):
-    """ Set the UsedSE for supplied files and the Status = 'Processed' """
-    res = self._getConnectionTransID( connection, transName )
-    if not res['OK']:
-      return res
-    connection = res['Value']['Connection']
-    transID = res['Value']['TransformationID']
-    res = self.setFileStatusForTransformation( transID, 'Processed', lfns, connection = connection )
-    if not res['OK']:
-      return res
-    resDict = res['Value']
-    res = self.__getFileIDsForLfns( resDict['Successful'].keys(), connection = connection )
-    if not res['OK']:
-      return res
-    fileIDs, lfnFilesIDs = res['Value']
-    updateUsedSE = []
-    for lfn, message in resDict['Successful'].items():
-      if message == 'Status updated to Processed':
-        updateUsedSE.append( lfnFilesIDs[lfn] )
-    if updateUsedSE:
-      print self.__setTransformationFileUsedSE( updateUsedSE, usedSE, connection = connection )
-    return S_OK( resDict )
+  def setFileStatusForTransformation( self, transID, fileStatusDict = {}, connection = False ):
+    """ Set file status for the given transformation, based on
+        fileStatusDict {fileID_A: 'statusA', fileID_B: 'statusB', ...}
 
-  def setFileStatusForTransformation( self, transName, status, lfns, force = False, connection = False ):
-    """ Set file status for the given transformation """
-    res = self._getConnectionTransID( connection, transName )
-    if not res['OK']:
-      return res
-    connection = res['Value']['Connection']
-    transID = res['Value']['TransformationID']
+        The ErrorCount is incremented automatically here
+    """
+    if not fileStatusDict:
+      return S_OK()
 
-    res = self.__getFileIDsForLfns( lfns, connection = connection )
-    if not res['OK']:
-      return res
-    fileIDs, lfnFilesIDs = res['Value']
-    successful = {}
-    failed = {}
-    res = self.getTransformationFiles( condDict = {'TransformationID':transID, 'LFN':lfns}, connection = connection )
-    if not res['OK']:
-      return res
-    transFiles = res['Value']
-    for fileDict in transFiles:
-      currentStatus = fileDict['Status']
-      errorCount = fileDict['ErrorCount']
-      lfn = fileDict['LFN']
-      fileID = fileDict['FileID']
-      if ( currentStatus.lower() == "processed" ) and ( status.lower() != "processed" ):
-        failed[lfn] = 'Can not change Processed status'
-        req = ''
-      elif ( currentStatus == status ):
-        successful[lfn] = 'Status not changed'
-        req = ''
-      elif ( status.lower() == 'unused' ):
-        if errorCount >= MAX_ERROR_COUNT:
-          if force:
-            req = "UPDATE TransformationFiles SET Status='%s', LastUpdate=UTC_TIMESTAMP(),ErrorCount=0 WHERE TransformationID=%d AND FileID=%d;" % ( status, transID, fileID )
-          else:  
-            failed[lfn] = 'Max number of resets reached'
-            req = "UPDATE TransformationFiles SET Status='MaxReset', LastUpdate=UTC_TIMESTAMP() WHERE TransformationID=%d AND FileID=%d;" % ( transID, fileID )
-        else:
-          req = "UPDATE TransformationFiles SET Status='%s', LastUpdate=UTC_TIMESTAMP(),ErrorCount=ErrorCount+1 WHERE TransformationID=%d AND FileID=%d;" % ( status, transID, fileID )
-      else:
-        req = "UPDATE TransformationFiles SET Status='%s', LastUpdate=UTC_TIMESTAMP() WHERE TransformationID=%d AND FileID=%d;" % ( status, transID, fileID )
-      if not req:
-        continue
-      res = self._update( req, connection )
-      if failed.has_key( lfn ) or successful.has_key( lfn ):
-        continue
-      if not res['OK']:
-        failed[lfn] = res['Message']
-      else:
-        successful[lfn] = 'Status updated to %s' % status
-    for lfn in lfns:
-      if ( not failed.has_key( lfn ) ) and ( not successful.has_key( lfn ) ):
-        failed[lfn] = 'File not found in the Transformation Database'
-    return S_OK( {"Successful":successful, "Failed":failed} )
+    # Building the request with "ON DUPLICATE KEY UPDATE"
+    req = "INSERT INTO TransformationFiles (TransformationID, FileID, Status, ErrorCount, LastUpdate) VALUES "
+
+    updatesList = []
+    for fileID, status in fileStatusDict.items():
+
+      updatesList.append( "(%d, %d, '%s', VALUES(ErrorCount), UTC_TIMESTAMP())" % ( transID, fileID, status ) )
+
+    req += ','.join( updatesList )
+    req += " ON DUPLICATE KEY UPDATE Status=VALUES(Status),ErrorCount=ErrorCount+1,LastUpdate=VALUES(LastUpdate)"
+
+    return self._update( req, connection )
 
   def getTransformationStats( self, transName, connection = False ):
-    """ Get number of files in Transformation Table for each status """
+    ''' Get number of files in Transformation Table for each status '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -647,7 +811,7 @@ class TransformationDB( DB ):
     return S_OK( statusDict )
 
   def getTransformationFilesCount( self, transName, field, selection = {}, connection = False ):
-    """ Get the number of files in the TransformationFiles table grouped by the supplied field """
+    ''' Get the number of files in the TransformationFiles table grouped by the supplied field '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -668,12 +832,13 @@ class TransformationDB( DB ):
     return S_OK( countDict )
 
   def __addFilesToTransformation( self, transID, fileIDs, connection = False ):
-    req = "SELECT FileID from TransformationFiles WHERE TransformationID = %d AND FileID IN (%s);" % ( transID, intListToString( fileIDs ) )
+    req = "SELECT FileID from TransformationFiles"
+    req = req + " WHERE TransformationID = %d AND FileID IN (%s);" % ( transID, intListToString( fileIDs ) )
     res = self._query( req, connection )
     if not res['OK']:
       return res
-    for tuple in res['Value']:
-      fileIDs.remove( tuple[0] )
+    for tupleIn in res['Value']:
+      fileIDs.remove( tupleIn[0] )
     if not fileIDs:
       return S_OK( [] )
     req = "INSERT INTO TransformationFiles (TransformationID,FileID,LastUpdate,InsertedTime) VALUES"
@@ -686,8 +851,9 @@ class TransformationDB( DB ):
     return S_OK( fileIDs )
 
   def __addExistingFiles( self, transID, connection = False ):
-    """ Add files that already exist in the DataFiles table to the transformation specified by the transID """
-    for tID, filter in self.filters:
+    ''' Add files that already exist in the DataFiles table to the transformation specified by the transID
+    '''
+    for tID, _filter in self.filters:
       if tID == transID:
         filters = [( tID, filter )]
         break
@@ -696,33 +862,51 @@ class TransformationDB( DB ):
     res = self.__getAllFileIDs( connection = connection )
     if not res['OK']:
       return res
-    fileIDs, lfnFilesIDs = res['Value']
+    fileIDs, _lfnFilesIDs = res['Value']
     passFilter = []
     for fileID, lfn in fileIDs.items():
       if self.__filterFile( lfn, filters ):
         passFilter.append( fileID )
     return self.__addFilesToTransformation( transID, passFilter, connection = connection )
 
-  def __insertExistingTransformationFiles( self, transID, fileTuples, connection = False ):
-    req = "INSERT INTO TransformationFiles (TransformationID,Status,TaskID,FileID,TargetSE,UsedSE,LastUpdate) VALUES"
-    candidates = False
-    for tuple in fileTuples:
-      lfn, originalID, fileID, status, taskID, targetSE, usedSE, errorCount, lastUpdate, insertTime = tuple[:10]
-      if status != 'Unused':
-        candidates = True
-        if not re.search( '-', status ):
-          status = "%s-%d" % ( status, originalID )
-          if taskID:
-            taskID = str( int( originalID ) ).zfill( 8 ) + '_' + str( int( taskID ) ).zfill( 8 )
-        req = "%s (%d,'%s','%s',%d,'%s','%s',UTC_TIMESTAMP())," % ( req, transID, status, taskID, fileID, targetSE, usedSE )
-    req = req.rstrip( "," )
-    if not candidates:
-      return S_OK()
-    return self._update( req, connection )
+  def __insertExistingTransformationFiles( self, transID, fileTuplesList, connection = False ):
+    """ Inserting already transformation files in TransformationFiles table (e.g. for deriving transformations)
+    """
+    gLogger.info( "Inserting %d files in TransformationFiles" % len( fileTuplesList ) )
+
+    # splitting in various chunks, in case it is too big
+    for fileTuples in breakListIntoChunks( fileTuplesList, 10000 ):
+
+      gLogger.verbose( "Adding first %d files in TransformationFiles (out of %d)" % ( len( fileTuples ),
+                                                                                      len( fileTuplesList ) ) )
+      req = "INSERT INTO TransformationFiles (TransformationID,Status,TaskID,FileID,TargetSE,UsedSE,LastUpdate) VALUES"
+      candidates = False
+
+      for ft in fileTuples:
+        _lfn, originalID, fileID, status, taskID, targetSE, usedSE, _errorCount, _lastUpdate, _insertTime = ft[:10]
+        if status not in ( 'Unused', 'Removed' ):
+          candidates = True
+          if not re.search( '-', status ):
+            status = "%s-inherited" % status
+            if taskID:
+              taskID = str( int( originalID ) ).zfill( 8 ) + '_' + str( int( taskID ) ).zfill( 8 )
+          req = "%s (%d,'%s','%s',%d,'%s','%s',UTC_TIMESTAMP())," % ( req, transID, status, taskID,
+                                                                      fileID, targetSE, usedSE )
+      if not candidates:
+        continue
+
+      req = req.rstrip( "," )
+      res = self._update( req, connection )
+      if not res['OK']:
+        return res
+
+    return S_OK()
 
   def __assignTransformationFile( self, transID, taskID, se, fileIDs, connection = False ):
-    """ Make necessary updates to the TransformationFiles table for the newly created task """
-    req = "UPDATE TransformationFiles SET TaskID='%d',UsedSE='%s',Status='Assigned',LastUpdate=UTC_TIMESTAMP() WHERE TransformationID = %d AND FileID IN (%s);" % ( taskID, se, transID, intListToString( fileIDs ) )
+    ''' Make necessary updates to the TransformationFiles table for the newly created task
+    '''
+    req = "UPDATE TransformationFiles SET TaskID='%d',UsedSE='%s',Status='Assigned',LastUpdate=UTC_TIMESTAMP()"
+    req = ( req + " WHERE TransformationID = %d AND FileID IN (%s);" ) % ( taskID, se, transID, intListToString( fileIDs ) )
     res = self._update( req, connection )
     if not res['OK']:
       gLogger.error( "Failed to assign file to task", res['Message'] )
@@ -750,14 +934,15 @@ class TransformationDB( DB ):
     return res
 
   def __resetTransformationFile( self, transID, taskID, connection = False ):
-    req = "UPDATE TransformationFiles SET TaskID=NULL, UsedSE='Unknown', Status='Unused' WHERE TransformationID = %d AND TaskID=%d;" % ( transID, taskID )
+    req = "UPDATE TransformationFiles SET TaskID=NULL, UsedSE='Unknown', Status='Unused'\
+     WHERE TransformationID = %d AND TaskID=%d;" % ( transID, taskID )
     res = self._update( req, connection )
     if not res['OK']:
       gLogger.error( "Failed to reset transformation file", res['Message'] )
     return res
 
   def __deleteTransformationFiles( self, transID, connection = False ):
-    """ Remove the files associated to a transformation """
+    ''' Remove the files associated to a transformation '''
     req = "DELETE FROM TransformationFiles WHERE TransformationID = %d;" % transID
     res = self._update( req, connection )
     if not res['OK']:
@@ -766,12 +951,36 @@ class TransformationDB( DB ):
 
   ###########################################################################
   #
+  # These methods manipulate the TransformationFileTasks table
+  #
+
+  def __deleteTransformationFileTask( self, transID, taskID, connection = False ):
+    ''' Delete the file associated to a given task of a given transformation
+        from the TransformationFileTasks table for transformation with TransformationID and TaskID
+    '''
+    req = "DELETE FROM TransformationFileTasks WHERE TransformationID=%d AND TaskID=%d" % ( transID, taskID )
+    return self._update( req, connection )
+
+  def __deleteTransformationFileTasks( self, transID, connection = False ):
+    ''' Remove all associations between files, tasks and a transformation '''
+    req = "DELETE FROM TransformationFileTasks WHERE TransformationID = %d;" % transID
+    res = self._update( req, connection )
+    if not res['OK']:
+      gLogger.error( "Failed to delete transformation files/task history", res['Message'] )
+    return res
+
+  ###########################################################################
+  #
   # These methods manipulate the TransformationTasks table
   #
 
-  def getTransformationTasks( self, condDict = {}, older = None, newer = None, timeStamp = 'CreationTime', orderAttribute = None, limit = None, inputVector = False, connection = False ):
+  def getTransformationTasks( self, condDict = {}, older = None, newer = None, timeStamp = 'CreationTime',
+                              orderAttribute = None, limit = None, inputVector = False,
+                              offset = None, connection = False ):
     connection = self.__getConnection( connection )
-    req = "SELECT %s FROM TransformationTasks %s" % ( intListToString( self.TASKSPARAMS ), self.buildCondition( condDict, older, newer, timeStamp, orderAttribute, limit ) )
+    req = "SELECT %s FROM TransformationTasks %s" % ( intListToString( self.TASKSPARAMS ),
+                                                      self.buildCondition( condDict, older, newer, timeStamp,
+                                                                           orderAttribute, limit, offset = offset ) )
     res = self._query( req, connection )
     if not res['OK']:
       return res
@@ -806,7 +1015,7 @@ class TransformationDB( DB ):
 
   def getTasksForSubmission( self, transName, numTasks = 1, site = '', statusList = ['Created'],
                              older = None, newer = None, connection = False ):
-    """ Select tasks with the given status (and site) for submission """
+    ''' Select tasks with the given status (and site) for submission '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -843,7 +1052,7 @@ class TransformationDB( DB ):
     return S_OK( resultDict )
 
   def deleteTasks( self, transName, taskIDbottom, taskIDtop, author = '', connection = False ):
-    """ Delete tasks with taskID range in transformation """
+    ''' Delete tasks with taskID range in transformation '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -858,13 +1067,15 @@ class TransformationDB( DB ):
     return res
 
   def reserveTask( self, transName, taskID, connection = False ):
-    """ Reserve the taskID from transformation for submission """
+    ''' Reserve the taskID from transformation for submission '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
     connection = res['Value']['Connection']
     transID = res['Value']['TransformationID']
-    res = self.__checkUpdate( "TransformationTasks", "ExternalStatus", "Reserved", {"TransformationID":transID, "TaskID":taskID}, connection = connection )
+    res = self.__checkUpdate( "TransformationTasks", "ExternalStatus", "Reserved", {"TransformationID":transID,
+                                                                                    "TaskID":taskID},
+                              connection = connection )
     if not res['OK']:
       return res
     if not res['Value']:
@@ -876,8 +1087,8 @@ class TransformationDB( DB ):
     return S_OK()
 
   def setTaskStatusAndWmsID( self, transName, taskID, status, taskWmsID, connection = False ):
-    """ Set status and ExternalID for job with taskID in production with transformationID
-    """
+    ''' Set status and ExternalID for job with taskID in production with transformationID
+    '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -889,7 +1100,7 @@ class TransformationDB( DB ):
     return self.__setTaskParameterValue( transID, taskID, 'ExternalID', taskWmsID, connection = connection )
 
   def setTaskStatus( self, transName, taskID, status, connection = False ):
-    """ Set status for job with taskID in production with transformationID """
+    ''' Set status for job with taskID in production with transformationID '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -906,49 +1117,50 @@ class TransformationDB( DB ):
     return S_OK()
 
   def getTransformationTaskStats( self, transName = '', connection = False ):
-    """ Returns dictionary with number of jobs per status for the given production.
-    """
+    ''' Returns dictionary with number of jobs per status for the given production.
+    '''
     connection = self.__getConnection( connection )
     if transName:
       res = self._getTransformationID( transName, connection = connection )
       if not res['OK']:
         gLogger.error( "Failed to get ID for transformation", res['Message'] )
         return res
-      res = self.getCounters( 'TransformationTasks', ['ExternalStatus'], {'TransformationID':res['Value']}, connection = connection )
+      res = self.getCounters( 'TransformationTasks', ['ExternalStatus'], {'TransformationID':res['Value']},
+                              connection = connection )
     else:
-      res = self.getCounters( 'TransformationTasks', ['ExternalStatus', 'TransformationID'], {}, connection = connection )
+      res = self.getCounters( 'TransformationTasks', ['ExternalStatus', 'TransformationID'], {},
+                              connection = connection )
     if not res['OK']:
       return res
-    if not res['Value']:
-      return S_ERROR( 'No records found' )
     statusDict = {}
     total = 0
     for attrDict, count in res['Value']:
       status = attrDict['ExternalStatus']
       statusDict[status] = count
       total += count
-    created = statusDict.get( 'Created', 0 )
-    statusDict['Created'] = total
-    statusDict['Submitted'] = ( total - created )
+    statusDict['TotalCreated'] = total
     return S_OK( statusDict )
 
   def __setTaskParameterValue( self, transID, taskID, paramName, paramValue, connection = False ):
-    req = "UPDATE TransformationTasks SET %s='%s', LastUpdateTime=UTC_TIMESTAMP() WHERE TransformationID=%d AND TaskID=%d;" % ( paramName, paramValue, transID, taskID )
+    req = "UPDATE TransformationTasks SET %s='%s', LastUpdateTime=UTC_TIMESTAMP()" % ( paramName, paramValue )
+    req = req + " WHERE TransformationID=%d AND TaskID=%d;" % ( transID, taskID )
     return self._update( req, connection )
 
   def __deleteTransformationTasks( self, transID, connection = False ):
-    """ Delete all the tasks from the TransformationTasks table for transformation with TransformationID """
+    ''' Delete all the tasks from the TransformationTasks table for transformation with TransformationID
+    '''
     req = "DELETE FROM TransformationTasks WHERE TransformationID=%d" % transID
     return self._update( req, connection )
 
   def __deleteTransformationTask( self, transID, taskID, connection = False ):
-    """ Delete the task from the TransformationTasks table for transformation with TransformationID """
+    ''' Delete the task from the TransformationTasks table for transformation with TransformationID
+    '''
     req = "DELETE FROM TransformationTasks WHERE TransformationID=%d AND TaskID=%d" % ( transID, taskID )
     return self._update( req, connection )
 
   ####################################################################
   #
-  # These methods manipulate the TransformationInputDataQuery table 
+  # These methods manipulate the TransformationInputDataQuery table
   #
 
   def createTransformationInputDataQuery( self, transName, queryDict, author = '', connection = False ):
@@ -965,7 +1177,6 @@ class TransformationDB( DB ):
       return S_ERROR( "Input data query already exists for transformation" )
     if res['Message'] != 'No InputDataQuery found for transformation':
       return res
-    insertTuples = []
     for parameterName in sortList( queryDict.keys() ):
       parameterValue = queryDict[parameterName]
       if not parameterValue:
@@ -980,16 +1191,18 @@ class TransformationDB( DB ):
         if type( parameterValue ) in [IntType, LongType]:
           parameterType = 'Integer'
           parameterValue = str( parameterValue )
-      insertTuples.append( "(%d,'%s','%s','%s')" % ( transID, parameterName, parameterValue, parameterType ) )
-    if not insertTuples:
-      return S_ERROR( "No input data query to be inserted" )
-    req = "INSERT INTO TransformationInputDataQuery (TransformationID,ParameterName,ParameterValue,ParameterType) VALUES %s" % ','.join( insertTuples )
-    res = self._update( req, connection )
-    if not res['OK']:
-      message = 'Failed to add input data query'
-      self.deleteTransformationInputDataQuery( transID, connection = connection )
-    else:
-      message = 'Added input data query'
+        if type( parameterValue ) == DictType:
+          parameterType = 'Dict'
+          parameterValue = str( parameterValue )
+      res = self.insertFields( 'TransformationInputDataQuery', ['TransformationID', 'ParameterName',
+                                                                'ParameterValue', 'ParameterType'],
+                               [transID, parameterName, parameterValue, parameterType], conn = connection )
+      if not res['OK']:
+        message = 'Failed to add input data query'
+        self.deleteTransformationInputDataQuery( transID, connection = connection )
+        break
+      else:
+        message = 'Added input data query'
     self.__updateTransformationLogging( transID, message, author, connection = connection )
     return res
 
@@ -1015,7 +1228,8 @@ class TransformationDB( DB ):
       return res
     connection = res['Value']['Connection']
     transID = res['Value']['TransformationID']
-    req = "SELECT ParameterName,ParameterValue,ParameterType FROM TransformationInputDataQuery WHERE TransformationID=%d;" % transID
+    req = "SELECT ParameterName,ParameterValue,ParameterType FROM TransformationInputDataQuery"
+    req = req + " WHERE TransformationID=%d;" % transID
     res = self._query( req, connection )
     if not res['OK']:
       return res
@@ -1027,6 +1241,8 @@ class TransformationDB( DB ):
           parameterValue = [int( x ) for x in parameterValue]
       elif parameterType == 'Integer':
         parameterValue = int( parameterValue )
+      elif parameterType == 'Dict':
+        parameterValue = eval( parameterValue )
       queryDict[parameterName] = parameterValue
     if not queryDict:
       return S_ERROR( "No InputDataQuery found for transformation" )
@@ -1038,7 +1254,7 @@ class TransformationDB( DB ):
   #
 
   def getTaskInputVector( self, transName, taskID, connection = False ):
-    """ Get input vector for the given task """
+    ''' Get input vector for the given task '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -1049,7 +1265,8 @@ class TransformationDB( DB ):
     else:
       taskIDList = list( taskID )
     taskString = ','.join( ["'" + str( x ) + "'" for x in taskIDList] )
-    req = "SELECT TaskID,InputVector FROM TaskInputs WHERE TaskID in (%s) AND TransformationID='%d';" % ( taskString, transID )
+    req = "SELECT TaskID,InputVector FROM TaskInputs WHERE TaskID in (%s) AND TransformationID='%d';" % ( taskString,
+                                                                                                          transID )
     res = self._query( req )
     inputVectorDict = {}
     if res['OK'] and res['Value']:
@@ -1061,13 +1278,14 @@ class TransformationDB( DB ):
     vector = str.join( ';', lfns )
     fields = ['TransformationID', 'TaskID', 'InputVector']
     values = [transID, taskID, vector]
-    res = self._insert( 'TaskInputs', fields, values, connection )
+    res = self.insertFields( 'TaskInputs', fields, values, connection )
     if not res['OK']:
       gLogger.error( "Failed to add input vector to task %d" % taskID )
     return res
 
   def __deleteTransformationTaskInputs( self, transID, taskID = 0, connection = False ):
-    """ Delete all the tasks inputs from the TaskInputs table for transformation with TransformationID """
+    ''' Delete all the tasks inputs from the TaskInputs table for transformation with TransformationID
+    '''
     req = "DELETE FROM TaskInputs WHERE TransformationID=%d" % transID
     if taskID:
       req = "%s AND TaskID=%d" % ( req, int( taskID ) )
@@ -1079,28 +1297,31 @@ class TransformationDB( DB ):
   #
 
   def __updateTransformationLogging( self, transName, message, authorDN, connection = False ):
-    """ Update the Transformation log table with any modifications
-    """
+    ''' Update the Transformation log table with any modifications
+    '''
     if not authorDN:
       res = getProxyInfo( False, False )
       if res['OK']:
-        authorDN = res['Value']['identity']
+        authorDN = res['Value']['subject']
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
     connection = res['Value']['Connection']
     transID = res['Value']['TransformationID']
-    req = "INSERT INTO TransformationLog (TransformationID,Message,Author,MessageDate) VALUES (%s,'%s','%s',UTC_TIMESTAMP());" % ( transID, message, authorDN )
+    req = "INSERT INTO TransformationLog (TransformationID,Message,Author,MessageDate)"
+    req = req + " VALUES (%s,'%s','%s',UTC_TIMESTAMP());" % ( transID, message, authorDN )
     return self._update( req, connection )
 
   def getTransformationLogging( self, transName, connection = False ):
-    """ Get logging info from the TransformationLog table """
+    ''' Get logging info from the TransformationLog table
+    '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
     connection = res['Value']['Connection']
     transID = res['Value']['TransformationID']
-    req = "SELECT TransformationID, Message, Author, MessageDate FROM TransformationLog WHERE TransformationID=%s ORDER BY MessageDate;" % ( transID )
+    req = "SELECT TransformationID, Message, Author, MessageDate FROM TransformationLog"
+    req = req + " WHERE TransformationID=%s ORDER BY MessageDate;" % ( transID )
     res = self._query( req )
     if not res['OK']:
       return res
@@ -1115,7 +1336,8 @@ class TransformationDB( DB ):
     return S_OK( transList )
 
   def __deleteTransformationLog( self, transID, connection = False ):
-    """ Remove the entries in the transformation log for a transformation """
+    ''' Remove the entries in the transformation log for a transformation
+    '''
     req = "DELETE FROM TransformationLog WHERE TransformationID=%d;" % transID
     return self._update( req, connection )
 
@@ -1124,7 +1346,8 @@ class TransformationDB( DB ):
   # These methods manipulate the DataFiles table
   #
   def __getAllFileIDs( self, connection = False ):
-    """ Get all the fileIDs for the supplied list of lfns """
+    ''' Get all the fileIDs for the supplied list of lfns
+    '''
     req = "SELECT LFN,FileID FROM DataFiles;"
     res = self._query( req, connection )
     if not res['OK']:
@@ -1137,7 +1360,9 @@ class TransformationDB( DB ):
     return S_OK( ( fids, lfns ) )
 
   def __getFileIDsForLfns( self, lfns, connection = False ):
-    """ Get file IDs for the given list of lfns """
+    """ Get file IDs for the given list of lfns
+        warning: if the file is not present, we'll see no errors
+    """
     req = "SELECT LFN,FileID FROM DataFiles WHERE LFN in (%s);" % ( stringListToString( lfns ) )
     res = self._query( req, connection )
     if not res['OK']:
@@ -1150,7 +1375,8 @@ class TransformationDB( DB ):
     return S_OK( ( fids, lfns ) )
 
   def __getLfnsForFileIDs( self, fileIDs, connection = False ):
-    """ Get lfns for the given list of fileIDs """
+    ''' Get lfns for the given list of fileIDs
+    '''
     req = "SELECT LFN,FileID FROM DataFiles WHERE FileID in (%s);" % stringListToString( fileIDs )
     res = self._query( req, connection )
     if not res['OK']:
@@ -1163,11 +1389,12 @@ class TransformationDB( DB ):
     return S_OK( ( fids, lfns ) )
 
   def __addDataFiles( self, lfns, connection = False ):
-    """ Add a file to the DataFiles table and retrieve the FileIDs """
+    ''' Add a file to the DataFiles table and retrieve the FileIDs
+    '''
     res = self.__getFileIDsForLfns( lfns, connection = connection )
     if not res['OK']:
       return res
-    fileIDs, lfnFileIDs = res['Value']
+    _fileIDs, lfnFileIDs = res['Value']
     for lfn in lfns:
       if not lfn in lfnFileIDs.keys():
         req = "INSERT INTO DataFiles (LFN,Status) VALUES ('%s','New');" % lfn
@@ -1178,84 +1405,56 @@ class TransformationDB( DB ):
     return S_OK( lfnFileIDs )
 
   def __setDataFileStatus( self, fileIDs, status, connection = False ):
-    """ Set the status of the supplied files """
+    ''' Set the status of the supplied files
+    '''
     req = "UPDATE DataFiles SET Status = '%s' WHERE FileID IN (%s);" % ( status, intListToString( fileIDs ) )
     return self._update( req, connection )
 
-  def __addFileTuples( self, fileTuples, connection = False ):
-    """ Add files and replicas """
-    lfns = [x[0] for x in fileTuples ]
-    res = self.__addDataFiles( lfns, connection = connection )
-    if not res['OK']:
-      return res
-    lfnFileIDs = res['Value']
-    toRemove = []
-    for lfn, pfn, se in fileTuples:
-      fileID = lfnFileIDs[lfn]
-      res = self.__addReplica( fileID, se, pfn, connection = connection )
-      if not res['OK']:
-        lfnFileIDs.pop( lfn )
-    return S_OK( lfnFileIDs )
-
   ###########################################################################
   #
-  # These methods manipulate the Replicas table
+  # Fill in / get the counters
   #
 
-  def __addReplica( self, fileID, se, pfn, connection = False ):
-    """ Add a SE,PFN for the given fileID in the Replicas table.
-    """
-    req = "SELECT FileID FROM Replicas WHERE FileID=%s AND SE='%s';" % ( fileID, se )
-    res = self._query( req, connection )
+  def updateTransformationCounters( self, counterDict, connection = False ):
+    ''' Insert in the table or update the transformation counters given a dict
+    '''
+    ##first, check that all the keys in this dict are among those expected
+    for key in self.tasksStatuses + self.fileStatuses:
+      if key not in counterDict.keys():
+        return S_ERROR( "Key %s not in the table" % key )
+
+    res = self.getFields( "TransformationCounters", ['TransformationID'],
+                          condDict = {'TransformationID' : counterDict['TransformationID']}, conn = connection )
     if not res['OK']:
       return res
-    elif res['Value']:
-      return S_OK()
-    req = "INSERT INTO Replicas (FileID,SE,PFN) VALUES (%s,'%s','%s');" % ( fileID, se, pfn )
-    res = self._update( req, connection )
-    if not res['OK']:
-      return res
+    if len( res['Value'] ): #if the Transformation is already in:
+      res = self.updateFields( "TransformationCounters",
+                               condDict = {'TransformationID' : counterDict['TransformationID']},
+                               updateDict = counterDict,
+                               conn = connection )
+      if not res['OK']:
+        return res
+    else:
+      res = self.insertFields( "TransformationCounters", inDict = counterDict, conn = connection )
+      if not res['OK']:
+        return res
+
     return S_OK()
 
-  def __getFileReplicas( self, fileIDs, allStatus = False, connection = False ):
-    fileReplicas = {}
-    req = "SELECT FileID,SE,PFN,Status FROM Replicas WHERE FileID IN (%s);" % intListToString( fileIDs )
-    res = self._query( req )
+  def getTransformationsCounters( self, TransIDs, connection = False ):
+    ''' Get all the counters for the given transformationIDs
+    '''
+    fields = ['TransformationID'] + self.tasksStatuses + self.fileStatuses
+    res = self.getFields( "TransformationCounters",
+                          outFields = fields, condDict = {'TransformationID' : TransIDs},
+                          conn = connection )
     if not res['OK']:
       return res
-    for fileID, se, pfn, status in res['Value']:
-      if ( allStatus ) or ( status.lower() != 'problematic' ):
-        if not fileReplicas.has_key( fileID ):
-          fileReplicas[fileID] = {}
-        fileReplicas[fileID][se] = pfn
-    return S_OK( fileReplicas )
+    resList = []
+    for row in res['Value']:
+      resList.append( dict( zip( fields, row ) ) )
 
-  def __deleteFileReplicas( self, fileIDs, se = '', connection = False ):
-    req = "DELETE FROM Replicas WHERE FileID IN (%s)" % intListToString( fileIDs )
-    if se:
-      req = "%s AND SE = '%s';" % ( req, se )
-    return self._update( req, connection )
-
-  def __updateReplicaStatus( self, fileIDs, status, se = '', connection = False ):
-    req = "UPDATE Replicas SET Status='%s' WHERE FileID IN (%s)" % ( status, intListToString( fileIDs ) )
-    if se and ( se.lower() != 'any' ):
-      req = "%s AND SE = '%s'" % ( req, se )
-    return self._update( req, connection )
-
-  def __getReplicaStatus( self, fileIDs, connection = False ):
-    req = "SELECT FileID,SE,Status FROM Replicas WHERE FileID IN (%s);" % intListToString( fileIDs )
-    return self._query( req )
-
-  def __updateReplicaSE( self, fileIDs, oldSE, newSE, connection = False ):
-    # First check whether there are existing replicas at this SE (to avoid primary key restrictions)
-    req = "SELECT FileID,SE FROM Replicas WHERE FileIDs IN (%s) AND SE = '%s';" % ( intListToString( fileIDs ), newSE )
-    res = self._query( req, connection )
-    if not res['OK']:
-      return res
-    for fileID, se in res['Value']:
-      fileIDs.remove( fileID )
-    req = "UPDATE Replicas SET SE='%s' WHERE FileID IN (%s) AND SE = '%s';" % ( newSE, intListToString( fileIDs ), oldSE )
-    return self._update( req, connection )
+    return S_OK( resList )
 
   ###########################################################################
   #
@@ -1263,8 +1462,8 @@ class TransformationDB( DB ):
   #
 
   def addTaskForTransformation( self, transID, lfns = [], se = 'Unknown', connection = False ):
-    """ Create a new task with the supplied files for a transformation.
-    """
+    ''' Create a new task with the supplied files for a transformation.
+    '''
     res = self._getConnectionTransID( connection, transID )
     if not res['OK']:
       return res
@@ -1276,32 +1475,38 @@ class TransformationDB( DB ):
       res = self.getTransformationFiles( condDict = {'TransformationID':transID, 'LFN':lfns}, connection = connection )
       if not res['OK']:
         return res
-      foundLfns = []
-      allAvailable = True
+      foundLfns = set()
       for fileDict in res['Value']:
         fileIDs.append( fileDict['FileID'] )
         lfn = fileDict['LFN']
-        foundLfns.append( lfn )
-        if fileDict['Status'] != 'Unused':
-          allAvailable = False
-          gLogger.error( "Supplied file not in Unused status but %s" % fileDict['Status'], lfn )
-      for lfn in lfns:
-        if not lfn in foundLfns:
-          allAvailable = False
-          gLogger.error( "Supplied file not found for transformation" % lfn )
-      if not allAvailable:
+        if fileDict['Status'] in self.allowedStatusForTasks:
+          foundLfns.add( lfn )
+        else:
+          gLogger.error( "Supplied file not in %s status but %s" % ( self.allowedStatusForTasks, fileDict['Status'] ), lfn )
+      unavailableLfns = set( lfns ) - foundLfns
+      if unavailableLfns:
+        gLogger.error( "Supplied files not found for transformation", sorted( unavailableLfns ) )
         return S_ERROR( "Not all supplied files available in the transformation database" )
 
     # Insert the task into the jobs table and retrieve the taskID
     self.lock.acquire()
-    req = "INSERT INTO TransformationTasks(TransformationID, ExternalStatus, ExternalID, TargetSE, CreationTime, LastUpdateTime) VALUES\
-     (%s,'%s','%d','%s', UTC_TIMESTAMP(), UTC_TIMESTAMP());" % ( transID, 'Created', 0, se )
+    req = "INSERT INTO TransformationTasks(TransformationID, ExternalStatus, ExternalID, TargetSE,"
+    req = req + " CreationTime, LastUpdateTime)"
+    req = req + " VALUES (%s,'%s','%d','%s', UTC_TIMESTAMP(), UTC_TIMESTAMP());" % ( transID, 'Created', 0, se )
     res = self._update( req, connection )
     if not res['OK']:
       self.lock.release()
       gLogger.error( "Failed to publish task for transformation", res['Message'] )
       return res
-    res = self._query( "SELECT LAST_INSERT_ID();", connection )
+
+    # With InnoDB, TaskID is computed by a trigger, which sets the local variable @last (per connection)
+    # @last is the last insert TaskID. With multi-row inserts, will be the first new TaskID inserted.
+    # The trigger TaskID_Generator must be present with the InnoDB schema (defined in TransformationDB.sql)
+    if self.isTransformationTasksInnoDB:
+      res = self._query( "SELECT @last;", connection )
+    else:
+      res = self._query( "SELECT LAST_INSERT_ID();", connection )
+
     self.lock.release()
     if not res['OK']:
       return res
@@ -1320,8 +1525,8 @@ class TransformationDB( DB ):
     return S_OK( taskID )
 
   def extendTransformation( self, transName, nTasks, author = '', connection = False ):
-    """ Extend SIMULATION type transformation by nTasks number of tasks
-    """
+    ''' Extend SIMULATION type transformation by nTasks number of tasks
+    '''
     connection = self.__getConnection( connection )
     res = self.getTransformation( transName, connection = connection )
     if not res['OK']:
@@ -1329,11 +1534,11 @@ class TransformationDB( DB ):
       return res
     transType = res['Value']['Type']
     transID = res['Value']['TransformationID']
-    extendableProds = gConfig.getValue( '/Operations/Production/%s/ExtendableTransfTypes' % self.__class__.__name__, ['simulation', 'mcsimulation'] )
-    if transType.lower() not in extendableProds:
+    extendableProds = Operations().getValue( 'Transformations/ExtendableTransfTypes', ['Simulation', 'MCSimulation'] )
+    if transType.lower() not in [ep.lower() for ep in extendableProds]:
       return S_ERROR( 'Can not extend non-SIMULATION type production' )
     taskIDs = []
-    for task in range( nTasks ):
+    for _task in range( nTasks ):
       res = self.addTaskForTransformation( transID, connection = connection )
       if not res['OK']:
         return res
@@ -1344,30 +1549,31 @@ class TransformationDB( DB ):
     return S_OK( taskIDs )
 
   def cleanTransformation( self, transName, author = '', connection = False ):
-    """ Clean the transformation specified by name or id """
+    ''' Clean the transformation specified by name or id '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
     connection = res['Value']['Connection']
     transID = res['Value']['TransformationID']
-    res = self.__deleteTransformationFiles( transID, connection = connection )
+    res = self.__deleteTransformationFileTasks( transID, connection = connection )
     if not res['OK']:
       return res
-    res = self.__deleteTransformationTasks( transID, connection = connection )
+    res = self.__deleteTransformationFiles( transID, connection = connection )
     if not res['OK']:
       return res
     res = self.__deleteTransformationTaskInputs( transID, connection = connection )
     if not res['OK']:
       return res
-    res = self.setTransformationParameter( transID, 'Status', 'Cleaned', author = author, connection = connection )
+    res = self.__deleteTransformationTasks( transID, connection = connection )
     if not res['OK']:
       return res
-    message = "Transformation Cleaned"
-    self.__updateTransformationLogging( transID, message, author, connection = connection )
+
+    self.__updateTransformationLogging( transID, "Transformation Cleaned", author, connection = connection )
+
     return S_OK( transID )
 
   def deleteTransformation( self, transName, author = '', connection = False ):
-    """ Remove the transformation specified by name or id """
+    ''' Remove the transformation specified by name or id '''
     res = self._getConnectionTransID( connection, transName )
     if not res['OK']:
       return res
@@ -1394,13 +1600,16 @@ class TransformationDB( DB ):
     res = self.__deleteTransformationTaskInputs( transID, taskID, connection = connection )
     if not res['OK']:
       return res
-    res = self.__deleteTransformationTask( transID, taskID, connection = connection )
+    res = self.__deleteTransformationFileTask( transID, taskID, connection = connection )
     if not res['OK']:
       return res
-    return self.__resetTransformationFile( transID, taskID, connection = connection )
+    res = self.__resetTransformationFile( transID, taskID, connection = connection )
+    if not res['OK']:
+      return res
+    return self.__deleteTransformationTask( transID, taskID, connection = connection )
 
   def __checkUpdate( self, table, param, paramValue, selectDict = {}, connection = False ):
-    """ Check whether the update will perform an update """
+    ''' Check whether the update will perform an update '''
     req = "UPDATE %s SET %s = '%s'" % ( table, param, paramValue )
     if selectDict:
       req = "%s %s" % ( req, self.buildCondition( selectDict ) )
@@ -1432,13 +1641,13 @@ class TransformationDB( DB ):
 ####################################################################################
 
   def exists( self, lfns, connection = False ):
-    """ Check the presence of the lfn in the TransformationDB DataFiles table
-    """
+    ''' Check the presence of the lfn in the TransformationDB DataFiles table
+    '''
     gLogger.info( "TransformationDB.exists: Attempting to determine existence of %s files." % len( lfns ) )
     res = self.__getFileIDsForLfns( lfns, connection = connection )
     if not res['OK']:
       return res
-    fileIDs, lfnFilesIDs = res['Value']
+    fileIDs, _lfnFilesIDs = res['Value']
     failed = {}
     successful = {}
     fileIDsValues = set( fileIDs.values() )
@@ -1450,30 +1659,22 @@ class TransformationDB( DB ):
     resDict = {'Successful':successful, 'Failed':failed}
     return S_OK( resDict )
 
-  def addReplica( self, replicaTuples, force = False ):
-    """ Add new replica to the TransformationDB for an existing lfn.
-    """
-    gLogger.info( "TransformationDB.addReplica: Attempting to add %s replicas." % len( replicaTuples ) )
-    fileTuples = []
-    for lfn, pfn, se, master in replicaTuples:
-      fileTuples.append( ( lfn, pfn, 0, se, 'IGNORED-GUID', 'IGNORED-CHECKSUM' ) )
-    return self.addFile( fileTuples, force )
-
-  def addFile( self, fileTuples, force = False, connection = False ):
+  def addFile( self, fileDicts, force = False, connection = False ):
     """  Add a new file to the TransformationDB together with its first replica.
+         In the input dict, the only mandatory info are PFN and SE
     """
-    gLogger.info( "TransformationDB.addFile: Attempting to add %s files." % len( fileTuples ) )
+    gLogger.info( "TransformationDB.addFile: Attempting to add %s files." % len( fileDicts.keys() ) )
     successful = {}
     failed = {}
-    # Determine which files pass the filters and are to be added to transformations 
+    # Determine which files pass the filters and are to be added to transformations
     transFiles = {}
     filesToAdd = []
-    for lfn, pfn, size, se, guid, checksum in fileTuples:
+    for lfn in fileDicts.keys():
       fileTrans = self.__filterFile( lfn )
       if not ( fileTrans or force ):
         successful[lfn] = True
       else:
-        filesToAdd.append( ( lfn, pfn, se ) )
+        filesToAdd.append( lfn )
         for trans in fileTrans:
           if not transFiles.has_key( trans ):
             transFiles[trans] = []
@@ -1481,103 +1682,36 @@ class TransformationDB( DB ):
     # Add the files to the DataFiles and Replicas tables
     if filesToAdd:
       connection = self.__getConnection( connection )
-      res = self.__addFileTuples( filesToAdd, connection = connection )
+      res = self.__addDataFiles( filesToAdd, connection = connection )
       if not res['OK']:
         return res
       lfnFileIDs = res['Value']
-      for lfn, pfn, se in filesToAdd:
+      for lfn in filesToAdd:
         if lfnFileIDs.has_key( lfn ):
           successful[lfn] = True
         else:
           failed[lfn] = True
       # Add the files to the transformations
-      #TODO: THIS SHOULD BE TESTED WITH A TRANSFORMATION WITH A FILTER
+      # TODO: THIS SHOULD BE TESTED WITH A TRANSFORMATION WITH A FILTER
       for transID, lfns in transFiles.items():
         fileIDs = []
         for lfn in lfns:
-          if lfn.has_key( lfn ):
+          if lfnFileIDs.has_key( lfn ):
             fileIDs.append( lfnFileIDs[lfn] )
         if fileIDs:
           res = self.__addFilesToTransformation( transID, fileIDs, connection = connection )
           if not res['OK']:
             gLogger.error( "Failed to add files to transformation", "%s %s" % ( transID, res['Message'] ) )
-    resDict = {'Successful':successful, 'Failed':failed}
-    return S_OK( resDict )
-
-  def getReplicas( self, lfns, allStatus = False, connection = False ):
-    """ Get replicas for the files specified by the lfn list """
-    gLogger.info( "TransformationDB.getReplicas: Attempting to get replicas for %s files." % len( lfns ) )
-    connection = self.__getConnection( connection )
-    res = self.__getFileIDsForLfns( lfns, connection = connection )
-    if not res['OK']:
-      return res
-    fileIDs, lfnFilesIDs = res['Value']
-    failed = {}
-    successful = {}
-    fileIDsValues = set( fileIDs.values() )
-    for lfn in lfns:
-      if not lfn in fileIDsValues:
-        failed[lfn] = 'File does not exist'
-    if fileIDs:
-      res = self.__getFileReplicas( fileIDs.keys(), allStatus = allStatus, connection = connection )
-      if not res['OK']:
-        return res
-      for fileID in fileIDs.keys():
-        # To catch the case where a file has no replicas
-        replicas = {}
-        if fileID in res['Value'].keys():
-          replicas = res['Value'][fileID]
-        successful[fileIDs[fileID]] = replicas
-    resDict = {'Successful':successful, 'Failed':failed}
-    return S_OK( resDict )
-
-  def removeReplica( self, replicaTuples, connection = False ):
-    """ Remove replica pfn of lfn. """
-    gLogger.info( "TransformationDB.removeReplica: Attempting to remove %s replicas." % len( replicaTuples ) )
-    successful = {}
-    failed = {}
-    lfns = []
-    for lfn, pfn, se in replicaTuples:
-      lfns.append( lfn )
-    connection = self.__getConnection( connection )
-    res = self.__getFileIDsForLfns( lfns, connection = connection )
-    if not res['OK']:
-      return res
-    fileIDs, lfnFilesIDs = res['Value']
-    for lfn in lfns:
-      if not lfnFilesIDs.has_key( lfn ):
-        successful[lfn] = 'File did not exist'
-    seFiles = {}
-    if fileIDs:
-      for lfn, pfn, se in replicaTuples:
-        if not seFiles.has_key( se ):
-          seFiles[se] = []
-        seFiles[se].append( lfnFilesIDs[lfn] )
-    for se, files in seFiles.items():
-      res = self.__deleteFileReplicas( files, se = se, connection = connection )
-      if not res['OK']:
-        for fileID in files:
-          failed[fileIDs[fileID]] = res['Message']
-      else:
-        for fileID in files:
-          successful[fileIDs[fileID]] = True
-    res = self.__getFileReplicas( fileIDs.keys(), allStatus = True, connection = connection )
-    if not res['OK']:
-      gLogger.warn( "Failed to remove single replica files" )
-    else:
-      noReplicas = []
-      fileReplicas = res['Value']
-      for fileID in fileIDs.keys():
-        if not fileID in fileReplicas.keys():
-          noReplicas.append( fileIDs[fileID] )
-      if noReplicas:
-        self.removeFile( noReplicas )
+            failed[lfn] = True
+            successful[lfn] = False
+          else:
+            successful[lfn] = True
     resDict = {'Successful':successful, 'Failed':failed}
     return S_OK( resDict )
 
   def removeFile( self, lfns, connection = False ):
-    """ Remove file specified by lfn from the ProcessingDB
-    """
+    ''' Remove file specified by lfn from the ProcessingDB
+    '''
     gLogger.info( "TransformationDB.removeFile: Attempting to remove %s files." % len( lfns ) )
     failed = {}
     successful = {}
@@ -1595,9 +1729,6 @@ class TransformationDB( DB ):
       res = self.__setTransformationFileStatus( fileIDs.keys(), 'Deleted', connection = connection )
       if not res['OK']:
         return res
-      res = self.__deleteFileReplicas( fileIDs.keys(), connection = connection )
-      if not res['OK']:
-        return S_ERROR( "TransformationDB.removeFile: Failed to remove file replicas." )
       res = self.__setDataFileStatus( fileIDs.keys(), 'Deleted', connection = connection )
       if not res['OK']:
         return S_ERROR( "TransformationDB.removeFile: Failed to remove files." )
@@ -1607,112 +1738,10 @@ class TransformationDB( DB ):
     resDict = {'Successful':successful, 'Failed':failed}
     return S_OK( resDict )
 
-  def setReplicaStatus( self, replicaTuples, connection = False ):
-    """Set status for the supplied replica tuples
-    """
-    gLogger.info( "TransformationDB.setReplicaStatus: Attempting to set statuses for %s replicas." % len( replicaTuples ) )
-    successful = {}
-    failed = {}
-    lfns = []
-    for lfn, pfn, se, status in replicaTuples:
-      lfns.append( lfn )
-    connection = self.__getConnection( connection )
-    res = self.__getFileIDsForLfns( lfns, connection = connection )
-    if not res['OK']:
-      return res
-    fileIDs, lfnFilesIDs = res['Value']
-    for lfn in lfns:
-      if not lfnFilesIDs.has_key( lfn ):
-        successful[lfn] = True # In the case that the file does not exist then return ok
-    seFiles = {}
-    if fileIDs:
-      for lfn, pfn, se, status in replicaTuples:
-        if not seFiles.has_key( se ):
-          seFiles[se] = {}
-        if not seFiles[se].has_key( status ):
-          seFiles[se][status] = []
-        seFiles[se][status].append( lfnFilesIDs[lfn] )
-    for se, statusDict in seFiles.items():
-      for status, files in statusDict.items():
-        res = self.__updateReplicaStatus( files, status, se = se, connection = connection )
-        if not res['OK']:
-          for fileID in files:
-            failed[fileIDs[fileID]] = res['Message']
-        else:
-          for fileID in files:
-            successful[fileIDs[fileID]] = True
-    resDict = {'Successful':successful, 'Failed':failed}
-    return S_OK( resDict )
-
-  def getReplicaStatus( self, replicaTuples, connection = False ):
-    """ Get the status for the supplied file replicas """
-    gLogger.info( "TransformationDB.getReplicaStatus: Attempting to get statuses of file replicas." )
-    failed = {}
-    successful = {}
-    lfns = []
-    for lfn, pfn, se in replicaTuples:
-      lfns.append( lfn )
-    connection = self.__getConnection( connection )
-    res = self.__getFileIDsForLfns( lfns, connection = connection )
-    if not res['OK']:
-      return res
-    fileIDs, lfnFilesIDs = res['Value']
-    for lfn in lfns:
-      if not lfnFilesIDs.has_key( lfn ):
-        failed[lfn] = 'File did not exist'
-    res = self.__getReplicaStatus( fileIDs.keys(), connection = connection )
-    if not res['OK']:
-      return res
-    for fileID, se, status in res['Value']:
-      lfn = fileIDs[fileID]
-      if not successful.has_key( lfn ):
-        successful[lfn] = {}
-      successful[lfn][se] = status
-    for lfn in fileIDs.values():
-      if not successful.has_key( lfn ):
-        failed[lfn] = "TransformationDB.getReplicaStatus: No replicas found."
-    resDict = {'Successful':successful, 'Failed':failed}
-    return S_OK( resDict )
-
-  def setReplicaHost( self, replicaTuples, connection = False ):
-    gLogger.info( "TransformationDB.setReplicaHost: Attempting to set SE for %s replicas." % len( replicaTuples ) )
-    successful = {}
-    failed = {}
-    lfns = []
-    for lfn, pfn, oldSE, newSE in replicaTuples:
-      lfns.append( lfn )
-    connection = self.__getConnection( connection )
-    res = self.__getFileIDsForLfns( lfns, connection = connection )
-    if not res['OK']:
-      return res
-    fileIDs, lfnFilesIDs = res['Value']
-    for lfn in lfns:
-      if not lfnFilesIDs.has_key( lfn ):
-        successful[lfn] = 'File did not exist'
-    seFiles = {}
-    if fileIDs:
-      for lfn, pfn, oldSE, newSE in replicaTuples:
-        if not seFiles.has_key( oldSE ):
-          seFiles[oldSE] = {}
-        if not seFiles[oldSE].has_key( newSE ):
-          seFiles[oldSE][newSE] = []
-        seFiles[oldSE][newSE].append( lfnFilesIDs[lfn] )
-    for oldSE, seDict in seFiles.items():
-      for newSE, files in seDict.items():
-        res = self.__updateReplicaSE( files, oldSE, newSE, connection = connection )
-        if not res['OK']:
-          for fileID in files:
-            failed[fileIDs[fileID]] = res['Message']
-        else:
-          for fileID in files:
-            successful[fileIDs[fileID]] = True
-    resDict = {'Successful':successful, 'Failed':failed}
-    return S_OK( resDict )
-
   def addDirectory( self, path, force = False ):
-    """ Adds all the files stored in a given directory in file catalog """
+    ''' Adds all the files stored in a given directory in file catalog '''
     gLogger.info( "TransformationDB.addDirectory: Attempting to populate %s." % path )
-    res = pythonCall( 0, self.__addDirectory, path, force )
+    res = pythonCall( 30, self.__addDirectory, path, force )
     if not res['OK']:
       gLogger.error( "Failed to invoke addDirectory with shifter proxy" )
       return res
@@ -1722,21 +1751,25 @@ class TransformationDB( DB ):
     res = setupShifterProxyInEnv( "ProductionManager" )
     if not res['OK']:
       return S_OK( "Failed to setup shifter proxy" )
-    catalog = CatalogDirectory()
+    catalog = FileCatalog()
     start = time.time()
-    res = catalog.getCatalogDirectoryReplicas( path, singleFile = True )
+    res = catalog.listDirectory( path )
     if not res['OK']:
-      gLogger.error( "TransformationDB.addDirectory: Failed to get replicas. %s" % res['Message'] )
+      gLogger.error( "TransformationDB.addDirectory: Failed to get files. %s" % res['Message'] )
       return res
-    gLogger.info( "TransformationDB.addDirectory: Obtained %s replicas in %s seconds." % ( path, time.time() - start ) )
-    fileTuples = []
-    for lfn, replicaDict in res['Value'].items():
-      for se, pfn in replicaDict.items():
-        fileTuples.append( ( lfn, pfn, 0, se, 'IGNORED-GUID', 'IGNORED-CHECKSUM' ) )
-    if fileTuples:
-      res = self.addFile( fileTuples, force = force )
+    if not path in res['Value']['Successful']:
+      gLogger.error( "TransformationDB.addDirectory: Failed to get files." )
+      return res
+    gLogger.info( "TransformationDB.addDirectory: Obtained %s files in %s seconds." % ( path, time.time() - start ) )
+    successful = []
+    failed = []
+    for lfn in res['Value']['Successful'][path]["Files"].keys():
+      res = self.addFile( {lfn:{}}, force = force )
       if not res['OK']:
-        return res
-      if not res['Value']['Successful']:
-        return S_ERROR( "Failed to add any files to database" )
-    return S_OK( len( res['Value']['Successful'] ) )
+        failed.append( lfn )
+        continue
+      if not lfn in res['Value']['Successful']:
+        failed.append( lfn )
+      else:
+        successful.append( lfn )
+    return {"OK":True, "Value": len( res['Value']['Successful'] ), "Successful":successful, "Failed": failed }

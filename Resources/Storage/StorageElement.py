@@ -3,32 +3,142 @@
 ########################################################################
 """ This is the StorageElement class.
 
-    self.name is the resolved name of the StorageElement i.e CERN-tape
-    self.options is dictionary containing the general options defined in the CS e.g. self.options['Backend] = 'Castor2'
-    self.storages is a list of the stub objects created by StorageFactory for the protocols found in the CS.
-    self.localProtocols is a list of the local protocols that were created by StorageFactory
-    self.remoteProtocols is a list of the remote protocols that were created by StorageFactory
-    self.protocolOptions is a list of dictionaries containing the options found in the CS. (should be removed)
 """
+
 __RCSID__ = "$Id$"
-
-
-from DIRAC                                              import gLogger, S_OK, S_ERROR
-from DIRAC.Resources.Storage.StorageFactory             import StorageFactory
-from DIRAC.Core.Utilities.Pfn                           import pfnparse
-from DIRAC.Core.Utilities.List                          import sortList
-from DIRAC.Core.Utilities.SiteSEMapping                 import getSEsForSite
-import re, types
+# # custom duty
+import re
+from types import ListType, StringType, StringTypes, DictType
+# # from DIRAC
+from DIRAC import gLogger, S_OK, S_ERROR, gConfig
+from DIRAC.Resources.Storage.StorageFactory import StorageFactory
+from DIRAC.Core.Utilities.Pfn import pfnparse
+from DIRAC.Core.Utilities.SiteSEMapping import getSEsForSite
+from DIRAC.Core.Security.ProxyInfo import getVOfromProxyGroup
+from DIRAC.ConfigurationSystem.Client.Helpers.Operations import Operations
+from DIRAC.ConfigurationSystem.Client.Helpers.Resources import Resources
+from DIRAC.ResourceStatusSystem.Client.ResourceStatus import ResourceStatus 
+from DIRAC.Resources.Utilities import Utils
 
 class StorageElement:
+  """
+  .. class:: StorageElement
 
-  def __init__( self, name, protocols = None, overwride = False ):
-    self.overwride = overwride
+  common interface to the grid storage element
+
+
+
+  self.name is the resolved name of the StorageElement i.e CERN-tape
+  self.options is dictionary containing the general options defined in the CS e.g. self.options['Backend] = 'Castor2'
+  self.storages is a list of the stub objects created by StorageFactory for the protocols found in the CS.
+  self.localProtocols is a list of the local protocols that were created by StorageFactory
+  self.remoteProtocols is a list of the remote protocols that were created by StorageFactory
+  self.protocolOptions is a list of dictionaries containing the options found in the CS. (should be removed)
+
+
+
+  dynamic method :
+  retransferOnlineFile( lfn )
+  exists( lfn )
+  isFile( lfn )
+  getFile( lfn, localPath = False )
+  putFile( lfnLocal, sourceSize = 0 ) : {lfn:local}
+  replicateFile( lfn, sourceSize = 0 )
+  getFileMetadata( lfn )
+  getFileSize( lfn )
+  removeFile( lfn )
+  prestageFile( lfn, lifetime = 86400 )
+  prestageFileStatus( lfn )
+  pinFile( lfn, lifetime = 60 * 60 * 24 )
+  releaseFile( lfn )
+  isDirectory( lfn )
+  getDirectoryMetadata( lfn )
+  getDirectorySize( lfn )
+  listDirectory( lfn )
+  removeDirectory( lfn, recursive = False )
+  createDirectory( lfn )
+  putDirectory( lfn )
+  getDirectory( lfn, localPath = False )
+
+
+  """
+
+  __deprecatedArguments = ["singleFile", "singleDirectory"]  # Arguments that are now useless
+
+  # Some methods have a different name in the StorageElement and the plugins...
+  # We could avoid this static list in the __getattr__ by checking the storage plugin and so on
+  # but fine... let's not be too smart, otherwise it becomes unreadable :-)
+  __equivalentMethodNames = {"exists" : "exists",
+                            "isFile" : "isFile",
+                            "getFile" : "getFile",
+                            "putFile" : "putFile",
+                            "replicateFile" : "putFile",
+                            "getFileMetadata" : "getFileMetadata",
+                            "getFileSize" : "getFileSize",
+                            "removeFile" : "removeFile",
+                            "prestageFile" : "prestageFile",
+                            "prestageFileStatus" : "prestageFileStatus",
+                            "pinFile" : "pinFile",
+                            "releaseFile" : "releaseFile",
+                            "isDirectory" : "isDirectory",
+                            "getDirectoryMetadata" : "getDirectoryMetadata",
+                            "getDirectorySize" : "getDirectorySize",
+                            "listDirectory" : "listDirectory",
+                            "removeDirectory" : "removeDirectory",
+                            "createDirectory" : "createDirectory",
+                            "putDirectory" : "putDirectory",
+                            "getDirectory" : "getDirectory",
+                            }
+
+  # We can set default argument in the __executeFunction which impacts all plugins
+  __defaultsArguments = {"putFile" : {"sourceSize"  : 0 },
+                         "getFile": { "localPath": False },
+                         "prestageFile" : { "lifetime" : 86400 },
+                         "pinFile" : { "lifetime" : 60 * 60 * 24 },
+                         "removeDirectory" : { "recursive" : False },
+                         "getDirectory" : { "localPath" : False },
+                         }
+
+  def __init__( self, name, protocols = None, vo = None ):
+    """ c'tor
+
+    :param str name: SE name
+    :param list protocols: requested protocols
+    :param vo
+    """
+
+    self.methodName = None
+
+    if vo:
+      self.vo = vo
+    else:
+      result = getVOfromProxyGroup()
+      if not result['OK']:
+        return
+      self.vo = result['Value']
+    self.opHelper = Operations( vo = self.vo )
+    self.resources = Resources( vo = self.vo )
+
+    proxiedProtocols = gConfig.getValue( '/LocalSite/StorageElements/ProxyProtocols', "" ).split( ',' )
+    result = self.resources.getAccessProtocols( name )
+    if result['OK']:
+      ap = result['Value'][0]
+      useProxy = ( self.resources.getAccessProtocolValue( ap, "Protocol", "UnknownProtocol" )
+                   in proxiedProtocols )
+
+    #print "Proxy", name, proxiedProtocols, \
+    #gConfig.getValue( "/Resources/StorageElements/%s/AccessProtocol.1/Protocol" % name, "xxx" )
+
+    if not useProxy:
+      useProxy = gConfig.getValue( '/LocalSite/StorageElements/%s/UseProxy' % name, False )
+    if not useProxy:
+      useProxy = self.opHelper.getValue( '/Services/StorageElements/%s/UseProxy' % name, False )
+
     self.valid = True
     if protocols == None:
-      res = StorageFactory().getStorages( name, protocolList = [] )
+      res = StorageFactory( useProxy ).getStorages( name, protocolList = [] )
     else:
-      res = StorageFactory().getStorages( name, protocolList = protocols )
+      res = StorageFactory( useProxy ).getStorages( name, protocolList = protocols )
     if not res['OK']:
       self.valid = False
       self.name = name
@@ -43,63 +153,67 @@ class StorageElement:
       self.protocolOptions = factoryDict['ProtocolOptions']
       self.turlProtocols = factoryDict['TurlProtocols']
 
-    self.readMethods = [   'getFile',
-                           'getAccessUrl',
-                           'getTransportURL',
-                           'getDirectory']
-    self.writeMethods = [  'retransferOnlineFile',
-                           'putFile',
-                           'replicateFile',
-                           'prestageFile',
-                           'prestageFileStatus',
-                           'pinFile',
-                           'releaseFile',
-                           'createDirectory',
-                           'putDirectory']
+    self.log = gLogger.getSubLogger( "SE[%s]" % self.name )
 
-    self.removeMethods = [
-                           'removeFile',
-                           'removeDirectory',
-                          ]
-    self.checkMethods = [
-                         'exists',
-                         'getDirectoryMetadata',
-                         'getDirectorySize',
-                         'getFileSize',
-                         'getFileMetadata',
-                         'getLocalProtocols',
-                         'getPfnForProtocol',
-                         'getPfnForLfn',
-                         'getPfnPath',
-                         'getProtocols',
-                         'getRemoteProtocols',
-                         'getStorageElementName',
-                         'getStorageElementOption',
-                         'getStorageParameters',
-                         'listDirectory',
-                         'isDirectory',
-                         'isFile',
-                         'isLocalSE'
-                         ]
+    self.readMethods = [ 'getFile',
+                         'getAccessUrl',
+                         'getTransportURL',
+                         'prestageFile',
+                         'prestageFileStatus',
+                         'getDirectory']
 
+    self.writeMethods = [ 'retransferOnlineFile',
+                          'putFile',
+                          'replicateFile',
+                          'pinFile',
+                          'releaseFile',
+                          'createDirectory',
+                          'putDirectory' ]
+
+    self.removeMethods = [ 'removeFile', 'removeDirectory' ]
+
+    self.checkMethods = [ 'exists',
+                          'getDirectoryMetadata',
+                          'getDirectorySize',
+                          'getFileSize',
+                          'getFileMetadata',
+                          'listDirectory',
+                          'isDirectory',
+                          'isFile',
+                           ]
+
+    self.okMethods = [ 'getLocalProtocols',
+                       'getPfnForProtocol',
+                       'getPfnForLfn',
+                       'getPfnPath',
+                       'getProtocols',
+                       'getRemoteProtocols',
+                       'getStorageElementName',
+                       'getStorageElementOption',
+                       'getStorageParameters',
+                       'isLocalSE' ]
+
+    self.__resourceStatus = ResourceStatus()
+    
   def dump( self ):
-    """
-      Dump to the logger a summary of the StorageElement items
-    """
-    gLogger.info( "StorageElement.dump: Preparing dump for StorageElement %s." % self.name )
+    """ Dump to the logger a summary of the StorageElement items. """
+    self.log.verbose( "dump: Preparing dump for StorageElement %s." % self.name )
+    if not self.valid:
+      self.log.debug( "dump: Failed to create StorageElement plugins.", self.errorReason )
+      return
     i = 1
     outStr = "\n\n============ Options ============\n"
-    for key in sortList( self.options.keys() ):
+    for key in sorted( self.options ):
       outStr = "%s%s: %s\n" % ( outStr, key.ljust( 15 ), self.options[key] )
 
     for storage in self.storages:
       outStr = "%s============Protocol %s ============\n" % ( outStr, i )
       res = storage.getParameters()
       storageParameters = res['Value']
-      for key in sortList( storageParameters.keys() ):
+      for key in sorted( storageParameters ):
         outStr = "%s%s: %s\n" % ( outStr, key.ljust( 15 ), storageParameters[key] )
       i = i + 1
-    gLogger.info( outStr )
+    self.log.verbose( outStr )
 
   #################################################################################################
   #
@@ -107,8 +221,17 @@ class StorageElement:
   #
 
   def getStorageElementName( self ):
-    gLogger.verbose( "StorageElement.getStorageElementName: The Storage Element name is %s." % self.name )
+    """ SE name getter """
+    self.log.verbose( "StorageElement.getStorageElementName: The Storage Element name is %s." % self.name )
     return S_OK( self.name )
+
+  def getChecksumType( self ):
+    """ get local /Resources/StorageElements/SEName/ChecksumType option if defined, otherwise
+        global /Resources/StorageElements/ChecksumType
+    """
+    self.log.verbose( "StorageElement.getChecksumType : get checksum type for %s." % self.name )
+    return S_OK( str( gConfig.getValue( "/Resources/StorageElements/ChecksumType", "ADLER32" ) ).upper()
+                 if "ChecksumType" not in self.options else str( self.options["ChecksumType"] ).upper() )
 
   def getStatus( self ):
     """
@@ -116,12 +239,16 @@ class StorageElement:
       - Read: True (is allowed), False (it is not allowed)
       - Write: True (is allowed), False (it is not allowed)
       - Remove: True (is allowed), False (it is not allowed)
-      - Check: True (is allowed), False (it is not allowed). NB: Check always allowed IF Read is allowed (regardless of what set in the Check option of the configuration)
+      - Check: True (is allowed), False (it is not allowed).
+      NB: Check always allowed IF Read is allowed (regardless of what set in the Check option of the configuration)
       - DiskSE: True if TXDY with Y > 0 (defaults to True)
       - TapeSE: True if TXDY with X > 0 (defaults to False)
       - TotalCapacityTB: float (-1 if not defined)
       - DiskCacheTB: float (-1 if not defined)
     """
+
+    self.log.verbose( "StorageElement.getStatus : determining status of %s." % self.name )
+
     retDict = {}
     if not self.valid:
       retDict['Read'] = False
@@ -136,20 +263,16 @@ class StorageElement:
 
     # If nothing is defined in the CS Access is allowed
     # If something is defined, then it must be set to Active
-    retDict['Read'] = not ( self.options.has_key( 'Read' ) and self.options['Read'] not in [ 'Active', 'Bad' ] )
-    #retDict['Read'] = not ( self.options.has_key( 'ReadAccess' ) and self.options['ReadAccess'] != 'Active' )
-    retDict['Write'] = not ( self.options.has_key( 'Write' ) and self.options['Write'] not in [ 'Active', 'Bad' ] )
-    #retDict['Write'] = not ( self.options.has_key( 'WriteAccess' ) and self.options['WriteAccess'] != 'Active' )
-    retDict['Remove'] = not ( self.options.has_key( 'Remove' ) and self.options['Remove'] not in [ 'Active', 'Bad' ] )
-    #retDict['Remove'] = not ( self.options.has_key( 'RemoveAccess' ) and self.options['RemoveAccess'] != 'Active' )
+    retDict['Read'] = self.__resourceStatus.isUsableStorage( self.name, 'ReadAccess' )
+    retDict['Write'] = self.__resourceStatus.isUsableStorage( self.name, 'WriteAccess' )
+    retDict['Remove'] = self.__resourceStatus.isUsableStorage( self.name, 'RemoveAccess' )
     if retDict['Read']:
       retDict['Check'] = True
     else:
-      #retDict['Check'] = not ( self.options.has_key( 'CheckAccess' ) and self.options['CheckAccess'] != 'Active' )
-      retDict['Check'] = not ( self.options.has_key( 'Check' ) and self.options['Check'] not in [ 'Active', 'Bad' ] )
+      retDict['Check'] = self.__resourceStatus.isUsableStorage( self.name, 'CheckAccess' )
     diskSE = True
     tapeSE = False
-    if self.options.has_key( 'SEType' ):
+    if 'SEType' in self.options:
       # Type should follow the convention TXDY
       seType = self.options['SEType']
       diskSE = re.search( 'D[1-9]', seType ) != None
@@ -168,113 +291,120 @@ class StorageElement:
     return S_OK( retDict )
 
   def isValid( self, operation = '' ):
-    gLogger.debug( "StorageElement.isValid: Determining whether the StorageElement %s is valid for %s" % ( self.name, operation ) )
-    if self.overwride:
+    """ check CS/RSS statuses for :operation:
+
+    :param str operation: operation name
+    """
+    self.log.verbose( "StorageElement.isValid: Determining whether the StorageElement %s is valid for %s" % ( self.name,
+                                                                                             operation ) )
+    if ( not operation ) or ( operation in self.okMethods ):
       return S_OK()
-    gLogger.verbose( "StorageElement.isValid: Determining whether the StorageElement %s is valid for use." % self.name )
+
     if not self.valid:
-      gLogger.error( "StorageElement.isValid: Failed to create StorageElement plugins.", self.errorReason )
+      self.log.debug( "StorageElement.isValid: Failed to create StorageElement plugins.", self.errorReason )
       return S_ERROR( self.errorReason )
     # Determine whether the StorageElement is valid for checking, reading, writing
     res = self.getStatus()
     if not res[ 'OK' ]:
-      gLogger.error( "Could not call getStatus" )
+      self.log.debug( "Could not call getStatus" )
       return S_ERROR( "StorageElement.isValid could not call the getStatus method" )
     checking = res[ 'Value' ][ 'Check' ]
     reading = res[ 'Value' ][ 'Read' ]
     writing = res[ 'Value' ][ 'Write' ]
     removing = res[ 'Value' ][ 'Remove' ]
 
-    # Determine whether the requested operation can be fulfilled    
+    # Determine whether the requested operation can be fulfilled
     if ( not operation ) and ( not reading ) and ( not writing ) and ( not checking ):
-      gLogger.error( "StorageElement.isValid: Read, write and check access not permitted." )
+      self.log.debug( "StorageElement.isValid: Read, write and check access not permitted." )
       return S_ERROR( "StorageElement.isValid: Read, write and check access not permitted." )
-    if not operation:
-      gLogger.warn( "StorageElement.isValid: The 'operation' argument is not supplied. It should be supplied in the future." )
-      return S_OK()
+
     # The supplied operation can be 'Read','Write' or any of the possible StorageElement methods.
-    if ( operation in self.readMethods ) or ( operation.lower() == 'read' ):
-      operation = 'Read'
-    elif operation in self.writeMethods or ( operation.lower() == 'write' ):
-      operation = 'Write'
-    elif operation in self.removeMethods or ( operation.lower() == 'remove' ):
-      operation = 'Remove'
-    elif operation in self.checkMethods or ( operation.lower() == 'check' ):
-      operation = 'Check'
+    if ( operation in self.readMethods ) or ( operation.lower() in ( 'read', 'readaccess' ) ):
+      operation = 'ReadAccess'
+    elif operation in self.writeMethods or ( operation.lower() in ( 'write', 'writeaccess' ) ):
+      operation = 'WriteAccess'
+    elif operation in self.removeMethods or ( operation.lower() in ( 'remove', 'removeaccess' ) ):
+      operation = 'RemoveAccess'
+    elif operation in self.checkMethods or ( operation.lower() in ( 'check', 'checkaccess' ) ):
+      operation = 'CheckAccess'
     else:
-      gLogger.error( "StorageElement.isValid: The supplied operation is not known.", operation )
+      self.log.debug( "StorageElement.isValid: The supplied operation is not known.", operation )
       return S_ERROR( "StorageElement.isValid: The supplied operation is not known." )
-    gLogger.debug( "in isValid check the operation: %s " % operation )
+    self.log.debug( "in isValid check the operation: %s " % operation )
     # Check if the operation is valid
-    if operation == 'Check':
+    if operation == 'CheckAccess':
       if not reading:
         if not checking:
-          gLogger.error( "StorageElement.isValid: Check access not currently permitted." )
+          self.log.debug( "StorageElement.isValid: Check access not currently permitted." )
           return S_ERROR( "StorageElement.isValid: Check access not currently permitted." )
-    if operation == 'Read':
+    if operation == 'ReadAccess':
       if not reading:
-        gLogger.error( "StorageElement.isValid: Read access not currently permitted." )
+        self.log.debug( "StorageElement.isValid: Read access not currently permitted." )
         return S_ERROR( "StorageElement.isValid: Read access not currently permitted." )
-    if operation == 'Write':
+    if operation == 'WriteAccess':
       if not writing:
-        gLogger.error( "StorageElement.isValid: Write access not currently permitted." )
+        self.log.debug( "StorageElementisValid: Write access not currently permitted." )
         return S_ERROR( "StorageElement.isValid: Write access not currently permitted." )
-    if operation == 'Remove':
+    if operation == 'RemoveAccess':
       if not removing:
-        gLogger.error( "StorageElement.isValid: Remove access not currently permitted." )
+        self.log.debug( "StorageElement.isValid: Remove access not currently permitted." )
         return S_ERROR( "StorageElement.isValid: Remove access not currently permitted." )
     return S_OK()
 
   def getProtocols( self ):
     """ Get the list of all the protocols defined for this Storage Element
     """
+    self.log.verbose( "StorageElement.getProtocols : Obtaining all protocols of %s." % self.name )
     if not self.valid:
       return S_ERROR( self.errorReason )
-    gLogger.verbose( "StorageElement.getProtocols: Obtaining all protocols for %s." % self.name )
     allProtocols = self.localProtocols + self.remoteProtocols
     return S_OK( allProtocols )
 
   def getRemoteProtocols( self ):
     """ Get the list of all the remote access protocols defined for this Storage Element
     """
+    self.log.verbose( "StorageElement.getRemoteProtocols: Obtaining remote protocols for %s." % self.name )
     if not self.valid:
       return S_ERROR( self.errorReason )
-    gLogger.verbose( "StorageElement.getRemoteProtocols: Obtaining remote protocols for %s." % self.name )
     return S_OK( self.remoteProtocols )
 
   def getLocalProtocols( self ):
     """ Get the list of all the local access protocols defined for this Storage Element
     """
+    self.log.verbose( "StorageElement.getLocalProtocols: Obtaining local protocols for %s." % self.name )
     if not self.valid:
       return S_ERROR( self.errorReason )
-    gLogger.verbose( "StorageElement.getLocalProtocols: Obtaining local protocols for %s." % self.name )
     return S_OK( self.localProtocols )
 
   def getStorageElementOption( self, option ):
     """ Get the value for the option supplied from self.options
+        :param option : option we are interested in
     """
+    self.log.verbose( "StorageElement.getStorageElementOption: Obtaining %s option for Storage Element %s." % ( option,
+                                                                                                 self.name ) )
     if not self.valid:
       return S_ERROR( self.errorReason )
-    gLogger.verbose( "StorageElement.getStorageElementOption: Obtaining %s option for Storage Element %s." % ( option, self.name ) )
-    if self.options.has_key( option ):
+    if option in self.options:
       optionValue = self.options[option]
       return S_OK( optionValue )
     else:
       errStr = "StorageElement.getStorageElementOption: Option not defined for SE."
-      gLogger.error( errStr, "%s for %s" % ( option, self.name ) )
+      self.log.debug( errStr, "%s for %s" % ( option, self.name ) )
       return S_ERROR( errStr )
 
   def getStorageParameters( self, protocol ):
     """ Get protocol specific options
+      :param protocol : protocol we are interested in
     """
-    gLogger.verbose( "StorageElement.getStorageParameters: Obtaining storage parameters for %s protocol %s." % ( self.name, protocol ) )
+    self.log.verbose( "StorageElement.getStorageParameters: Obtaining storage parameters for %s protocol %s." % ( self.name,
+                                                                                                   protocol ) )
     res = self.getProtocols()
     if not res['OK']:
       return res
     availableProtocols = res['Value']
     if not protocol in availableProtocols:
       errStr = "StorageElement.getStorageParameters: Requested protocol not available for SE."
-      gLogger.error( errStr, '%s for %s' % ( protocol, self.name ) )
+      self.log.debug( errStr, '%s for %s' % ( protocol, self.name ) )
       return S_ERROR( errStr )
     for storage in self.storages:
       res = storage.getParameters()
@@ -282,14 +412,15 @@ class StorageElement:
       if storageParameters['ProtocolName'] == protocol:
         return S_OK( storageParameters )
     errStr = "StorageElement.getStorageParameters: Requested protocol supported but no object found."
-    gLogger.error( errStr, "%s for %s" % ( protocol, self.name ) )
+    self.log.debug( errStr, "%s for %s" % ( protocol, self.name ) )
     return S_ERROR( errStr )
 
   def isLocalSE( self ):
     """ Test if the Storage Element is local in the current context
     """
+    self.log.verbose( "StorageElement.isLocalSE: Determining whether %s is a local SE." % self.name )
+
     import DIRAC
-    gLogger.verbose( "StorageElement.isLocalSE: Determining whether %s is a local SE." % self.name )
     localSEs = getSEsForSite( DIRAC.siteName() )['Value']
     if self.name in localSEs:
       return S_OK( True )
@@ -298,22 +429,31 @@ class StorageElement:
 
   #################################################################################################
   #
-  # These are the basic get functions for pfn manipulation
+  # These are the basic get functions for lfn manipulation
   #
 
-  def getPfnForProtocol( self, pfn, protocol, withPort = True ):
-    """ Transform the input pfn into another with the given protocol for the Storage Element.
+
+  def __getSinglePfnForProtocol( self, pfn, protocol, withPort = True ):
+    """ Transform the input pfn into a pfn with the given protocol for the Storage Element.
+      :param pfn : input PFN
+      :param protocol : string or list of string of the protocol we want
+      :param withPort : includes the port in the returned pfn
     """
+    self.log.verbose( "StorageElement.getSinglePfnForProtocol: Getting pfn for given protocols in %s." % self.name )
+
+
+    # This test of the available protocols could actually be done in getPfnForProtocol once for all
+    # but it is safer to put it here in case we decide to call this method internally (which I doubt!)
     res = self.getProtocols()
     if not res['OK']:
       return res
-    if type( protocol ) == types.StringType:
+    if type( protocol ) == StringType:
       protocols = [protocol]
-    elif type( protocol ) == types.ListType:
+    elif type( protocol ) == ListType:
       protocols = protocol
     else:
-      errStr = "StorageElement.getPfnForProtocol: Supplied protocol must be string or list of strings."
-      gLogger.error( errStr, "%s %s" % ( protocol, self.name ) )
+      errStr = "StorageElement.getSinglePfnForProtocol: Supplied protocol must be string or list of strings."
+      self.log.debug( errStr, "%s %s" % ( protocol, self.name ) )
       return S_ERROR( errStr )
     availableProtocols = res['Value']
     protocolsToTry = []
@@ -321,11 +461,11 @@ class StorageElement:
       if protocol in availableProtocols:
         protocolsToTry.append( protocol )
       else:
-        errStr = "StorageElement.getPfnForProtocol: Requested protocol not available for SE."
-        gLogger.warn( errStr, '%s for %s' % ( protocol, self.name ) )
+        errStr = "StorageElement.getSinglePfnForProtocol: Requested protocol not available for SE."
+        self.log.debug( errStr, '%s for %s' % ( protocol, self.name ) )
     if not protocolsToTry:
-      errStr = "StorageElement.getPfnForProtocol: None of the requested protocols were available for SE."
-      gLogger.error( errStr, '%s for %s' % ( protocol, self.name ) )
+      errStr = "StorageElement.getSinglePfnForProtocol: None of the requested protocols were available for SE."
+      self.log.debug( errStr, '%s for %s' % ( protocol, self.name ) )
       return S_ERROR( errStr )
     # Check all available storages for required protocol then contruct the PFN
     for storage in self.storages:
@@ -336,14 +476,53 @@ class StorageElement:
           res = storage.getProtocolPfn( res['Value'], withPort )
           if res['OK']:
             return res
-    errStr = "StorageElement.getPfnForProtocol: Failed to get PFN for requested protocols."
-    gLogger.error( errStr, "%s for %s" % ( protocols, self.name ) )
+    errStr = "StorageElement.getSinglePfnForProtocol: Failed to get PFN for requested protocols."
+    self.log.debug( errStr, "%s for %s" % ( protocols, self.name ) )
     return S_ERROR( errStr )
+
+
+
+  def getPfnForProtocol( self, pfns, protocol = "SRM2", withPort = True ):
+    """ create PFNs strings using protocol :protocol:
+
+    :param self: self reference
+    :param list pfns: list of PFNs
+    :param str protocol: protocol name (default: 'SRM2')
+    :param bool withPort: flag to include port in PFN (default: True)
+    """
+
+    if type( pfns ) in StringTypes:
+      pfnDict = {pfns:False}
+    elif type( pfns ) == ListType:
+      pfnDict = {}
+      for pfn in pfns:
+        pfnDict[pfn] = False
+    elif type( pfns ) == DictType:
+      pfnDict = pfns
+    else:
+      errStr = "StorageElement.getLfnForPfn: Supplied pfns must be string, list of strings or a dictionary."
+      self.log.debug( errStr )
+      return S_ERROR( errStr )
+
+
+    res = self.isValid( "getPfnForProtocol" )
+    if not res["OK"]:
+      return res
+    retDict = { "Successful" : {}, "Failed" : {}}
+    for pfn in pfnDict:
+      res = self.__getSinglePfnForProtocol( pfn, protocol, withPort = withPort )
+      if res["OK"]:
+        retDict["Successful"][pfn] = res["Value"]
+      else:
+        retDict["Failed"][pfn] = res["Message"]
+    return S_OK( retDict )
+
 
   def getPfnPath( self, pfn ):
     """  Get the part of the PFN path below the basic storage path.
          This path must coincide with the LFN of the file in order to be compliant with the LHCb conventions.
     """
+    self.log.verbose( "StorageElement.getPfnPath: Getting path from pfn in %s." % self.name )
     if not self.valid:
       return S_ERROR( self.errorReason )
     res = pfnparse( pfn )
@@ -370,213 +549,238 @@ class StorageElement:
         return S_OK( pfnPath )
     # This should never happen. DANGER!!
     errStr = "StorageElement.getPfnPath: Failed to get the pfn path for any of the protocols!!"
-    gLogger.error( errStr )
+    self.log.debug( errStr )
     return S_ERROR( errStr )
 
-  def getPfnForLfn( self, lfn ):
-    """ Get the full PFN constructed from the LFN.
+
+
+  def getLfnForPfn( self, pfns ):
+    """ Get the LFN from the PFNS .
+        :param lfn : input lfn or lfns (list/dict)
     """
-    if not self.valid:
-      return S_ERROR( self.errorReason )
+
+    if type( pfns ) in StringTypes:
+      pfnDict = {pfns:False}
+    elif type( pfns ) == ListType:
+      pfnDict = {}
+      for pfn in pfns:
+        pfnDict[pfn] = False
+    elif type( pfns ) == DictType:
+      pfnDict = pfns.copy()
+    else:
+      errStr = "StorageElement.getLfnForPfn: Supplied pfns must be string, list of strings or a dictionary."
+      self.log.debug( errStr )
+      return S_ERROR( errStr )
+
+
+    res = self.isValid( "getPfnPath" )
+    if not res['OK']:
+      self.log.error( "StorageElement.getLfnForPfn: Failed to instantiate StorageElement at %s" % self.name )
+      return res
+    retDict = { "Successful" : {}, "Failed" : {} }
+    for pfn in pfnDict:
+      res = self.getPfnPath( pfn )
+      if res["OK"]:
+        retDict["Successful"][pfn] = res["Value"]
+      else:
+        retDict["Failed"][pfn] = res["Message"]
+    return S_OK( retDict )
+
+
+
+  def __getSinglePfnForLfn( self, lfn ):
+    """ Get the full PFN constructed from the LFN.
+        :param lfn : input lfn or lfns (list/dict)
+    """
+    self.log.debug( "StorageElement.__getSinglePfnForLfn: Getting pfn from lfn in %s." % self.name )
+
     for storage in self.storages:
       res = storage.getPFNBase()
       if res['OK']:
         fullPath = "%s%s" % ( res['Value'], lfn )
         return S_OK( fullPath )
     # This should never happen. DANGER!!
-    errStr = "StorageElement.getPfnForLfn: Failed to get the full pfn for any of the protocols!!"
-    gLogger.error( errStr )
+    errStr = "StorageElement.__getSinglePfnForLfn: Failed to get the full pfn for any of the protocols (%s)!!" % ( self.name )
+    self.log.debug( errStr )
     return S_ERROR( errStr )
+
+  def getPfnForLfn( self, lfns ):
+    """ get PFNs for supplied LFNs at :storageElementName: SE
+
+    :param self: self reference
+    :param list lfns: list of LFNs
+    :param str stotrageElementName: DIRAC SE name
+    """
+
+    if type( lfns ) in StringTypes:
+      lfnDict = {lfns:False}
+    elif type( lfns ) == ListType:
+      lfnDict = {}
+      for lfn in lfns:
+        lfnDict[lfn] = False
+    elif type( lfns ) == DictType:
+      lfnDict = lfns.copy()
+    else:
+      errStr = "StorageElement.getPfnForLfn: Supplied lfns must be string, list of strings or a dictionary."
+      self.log.debug( errStr )
+      return S_ERROR( errStr )
+
+    if not self.valid:
+      return S_ERROR( self.errorReason )
+
+    retDict = { "Successful" : {}, "Failed" : {} }
+    for lfn in lfnDict:
+      res = self.__getSinglePfnForLfn( lfn )
+      if res["OK"]:
+        retDict["Successful"][lfn] = res["Value"]
+      else:
+        retDict["Failed"][lfn] = res["Message"]
+    return S_OK( retDict )
+
+
+  def getPFNBase( self ):
+    """ Get the base to construct a PFN
+    """
+    self.log.verbose( "StorageElement.getPFNBase: Getting pfn base for %s." % self.name )
+
+    if not self.storages:
+      return S_ERROR( 'No storages defined' )
+    for storage in self.storages:
+      result = storage.getPFNBase()
+      if result['OK']:
+        return result
+
+    return result
 
   ###########################################################################################
   #
   # This is the generic wrapper for file operations
   #
 
-  def retransferOnlineFile( self, pfn, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'retransferOnlineFile' )
-    else:
-      return self.__executeFunction( pfn, 'retransferOnlineFile' )
+  def getAccessUrl( self, lfn, protocol = False, singleFile = None ):
+    """ execute 'getTransportURL' operation.
+      :param str lfn: string, list or dictionnary of lfns
+      :param protocol: if no protocol is specified, we will request self.turlProtocols
+    """
 
-  def exists( self, pfn, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'exists' )
-    else:
-      return self.__executeFunction( pfn, 'exists' )
+    self.log.verbose( "StorageElement.getAccessUrl: Getting accessUrl for lfn in %s." % self.name )
 
-  def isFile( self, pfn, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'isFile' )
-    else:
-      return self.__executeFunction( pfn, 'isFile' )
-
-  def getFile( self, pfn, localPath = False, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'getFile', {'localPath':localPath} )
-    else:
-      return self.__executeFunction( pfn, 'getFile', {'localPath':localPath} )
-
-  def putFile( self, pfn, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'putFile' )
-    else:
-      return self.__executeFunction( pfn, 'putFile' )
-
-  def replicateFile( self, pfn, sourceSize = 0, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'putFile', {'sourceSize':sourceSize} )
-    else:
-      return self.__executeFunction( pfn, 'putFile', {'sourceSize':sourceSize} )
-
-  def getFileMetadata( self, pfn, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'getFileMetadata' )
-    else:
-      return self.__executeFunction( pfn, 'getFileMetadata' )
-
-  def getFileSize( self, pfn, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'getFileSize' )
-    else:
-      return self.__executeFunction( pfn, 'getFileSize' )
-
-  def getAccessUrl( self, pfn, protocol = False, singleFile = False ):
     if not protocol:
       protocols = self.turlProtocols
     else:
       protocols = [protocol]
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'getTransportURL', {'protocols':protocols} )
-    else:
-      return self.__executeFunction( pfn, 'getTransportURL', {'protocols':protocols} )
 
-  def removeFile( self, pfn, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'removeFile' )
-    else:
-      return self.__executeFunction( pfn, 'removeFile' )
 
-  def prestageFile( self, pfn, lifetime = 60 * 60 * 24, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'prestageFile' )
-    else:
-      return self.__executeFunction( pfn, 'prestageFile' )
+    argDict = {"protocols" : protocols}
+    if singleFile is not None:
+      argDict["singleFile"] = singleFile
 
-  def prestageFileStatus( self, pfn, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'prestageFileStatus' )
-    else:
-      return self.__executeFunction( pfn, 'prestageFileStatus' )
+    self.methodName = "getTransportURL"
+    return self.__executeMethod( lfn, **argDict )
 
-  def pinFile( self, pfn, lifetime = 60 * 60 * 24, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'pinFile', {'lifetime':lifetime} )
-    else:
-      return self.__executeFunction( pfn, 'pinFile', {'lifetime':lifetime} )
 
-  def releaseFile( self, pfn, singleFile = False ):
-    if singleFile:
-      return self.__executeSingleFile( pfn, 'releaseFile' )
-    else:
-      return self.__executeFunction( pfn, 'releaseFile' )
-
-  def isDirectory( self, pfn, singleDirectory = False ):
-    if singleDirectory:
-      return self.__executeSingleFile( pfn, 'isDirectory' )
-    else:
-      return self.__executeFunction( pfn, 'isDirectory' )
-
-  def getDirectoryMetadata( self, pfn, singleDirectory = False ):
-    if singleDirectory:
-      return self.__executeSingleFile( pfn, 'getDirectoryMetadata' )
-    else:
-      return self.__executeFunction( pfn, 'getDirectoryMetadata' )
-
-  def getDirectorySize( self, pfn, singleDirectory = False ):
-    if singleDirectory:
-      return self.__executeSingleFile( pfn, 'getDirectorySize' )
-    else:
-      return self.__executeFunction( pfn, 'getDirectorySize' )
-
-  def listDirectory( self, pfn, singleDirectory = False ):
-    if singleDirectory:
-      return self.__executeSingleFile( pfn, 'listDirectory' )
-    else:
-      return self.__executeFunction( pfn, 'listDirectory' )
-
-  def removeDirectory( self, pfn, recursive = False, singleDirectory = False ):
-    if singleDirectory:
-      return self.__executeSingleFile( pfn, 'removeDirectory', {'recursive':recursive} )
-    else:
-      return self.__executeFunction( pfn, 'removeDirectory', {'recursive':recursive} )
-
-  def createDirectory( self, pfn, singleDirectory = False ):
-    if singleDirectory:
-      return self.__executeSingleFile( pfn, 'createDirectory' )
-    else:
-      return self.__executeFunction( pfn, 'createDirectory' )
-
-  def putDirectory( self, pfn, singleDirectory = False ):
-    if singleDirectory:
-      return self.__executeSingleFile( pfn, 'putDirectory' )
-    else:
-      return self.__executeFunction( pfn, 'putDirectory' )
-
-  def getDirectory( self, pfn, localPath = False, singleDirectory = False ):
-    if singleDirectory:
-      return self.__executeSingleFile( pfn, 'getDirectory', {'localPath':localPath} )
-    else:
-      return self.__executeFunction( pfn, 'getDirectory', {'localPath':localPath} )
-
-  def __executeSingleFile( self, pfn, operation, arguments = None ):
-    if arguments == None:
-      res = self.__executeFunction( pfn, operation, {} )
-    else:
-      res = self.__executeFunction( pfn, operation, arguments )
-    if type( pfn ) == types.ListType:
-      pfn = pfn[0]
-    elif type( pfn ) == types.DictType:
-      pfn = pfn.keys()[0]
-    if not res['OK']:
-      return res
-    elif res['Value']['Failed'].has_key( pfn ):
-      errorMessage = res['Value']['Failed'][pfn]
-      return S_ERROR( errorMessage )
-    else:
-      return S_OK( res['Value']['Successful'][pfn] )
-
-  def __executeFunction( self, pfn, method, argsDict = None ):
+  def __generatePfnDict( self, lfns, storage ):
+    """ Generates a dictionnary (pfn : lfn ), where the pfn are constructed
+        from the lfn using the getProtocolPfn method of the storage plugins.
+        :param: lfns : dictionnary {lfn:whatever}
+        :returns dictionnary {constructed pfn : lfn}
     """
-        'pfn' is the physical file name (as registered in the LFC)
-        'method' is the functionality to be executed
+    self.log.verbose( "StorageElement.__generatePfnDict: generating pfn dict for %s lfn in %s." % ( len( lfns ), self.name ) )
+
+    pfnDict = {}  # pfn : lfn
+    failed = {}  # lfn : string with errors
+    for lfn in lfns:
+
+      if ":" in lfn:
+        errStr = "StorageElement.__generatePfnDict: received a pfn as input. It should not happen anymore, please check your code"
+        self.log.verbose( errStr, lfn )
+      res = pfnparse( lfn )  # pfnparse can take an lfn as input, it will just fill the path and filename
+      if not res['OK']:
+        errStr = "StorageElement.__generatePfnDict: Failed to parse supplied LFN."
+        self.log.debug( errStr, "%s: %s" % ( lfn, res['Message'] ) )
+        if lfn not in failed:
+          failed[lfn] = ''
+        failed[lfn] = "%s %s" % ( failed[lfn], errStr )
+      else:
+        res = storage.getProtocolPfn( res['Value'], True )
+        if not res['OK']:
+          errStr = "StorageElement.__generatePfnDict %s." % res['Message']
+          self.log.debug( errStr, 'for %s' % ( lfn ) )
+          if lfn not in failed:
+            failed[lfn] = ''
+          failed[lfn] = "%s %s" % ( failed[lfn], errStr )
+        else:
+          pfnDict[res['Value']] = lfn
+    res = S_OK( pfnDict )
+    res['Failed'] = failed
+    return res
+
+
+  def __executeMethod( self, lfn, *args, **kwargs ):
+    """ Forward the call to each storage in turn until one works.
+        The method to be executed is stored in self.methodName
+        :param lfn : string, list or dictionnary
+        :param *args : variable amount of non-keyword arguments. SHOULD BE EMPTY
+        :param **kwargs : keyword arguments
+        :returns S_OK( { 'Failed': {lfn : reason} , 'Successful': {lfn : value} } )
+                The Failed dict contains the lfn only if the operation failed on all the storages
+                The Successful dict contains the value returned by the successful storages.
     """
-    if type( pfn ) in types.StringTypes:
-      pfns = {pfn:False}
-    elif type( pfn ) == types.ListType:
-      pfns = {}
-      for url in pfn:
-        pfns[url] = False
-    elif type( pfn ) == types.DictType:
-      pfns = pfn.copy()
+
+    removedArgs = {}
+    self.log.verbose( "StorageElement.__executeMethod : preparing the execution of %s" % ( self.methodName ) )
+
+    # args should normaly be empty to avoid problem...
+    if len( args ):
+      self.log.verbose( "StorageElement.__executeMethod: args should be empty!%s" % args )
+      # because there is normaly normaly only one kw argument, I can move it from args to kwargs
+      methDefaultArgs = StorageElement.__defaultsArguments.get( self.methodName, {} ).keys()
+      if len( methDefaultArgs ):
+        kwargs[methDefaultArgs[0] ] = args[0]
+        args = args[1:]
+      self.log.verbose( "StorageElement.__executeMethod: put it in kwargs, but dirty and might be dangerous!args %s kwargs %s" % ( args, kwargs ) )
+
+
+    # We check the deprecated arguments
+    for depArg in StorageElement.__deprecatedArguments:
+      if depArg in kwargs:
+        self.log.verbose( "StorageElement.__executeMethod: %s is not an allowed argument anymore. Please change your code!" % depArg )
+        removedArgs[depArg] = kwargs[depArg]
+        del kwargs[depArg]
+
+
+
+    # Set default argument if any
+    methDefaultArgs = StorageElement.__defaultsArguments.get( self.methodName, {} )
+    for argName in methDefaultArgs:
+      if argName not in kwargs:
+        self.log.debug( "StorageElement.__executeMethod : default argument %s for %s not present.\
+         Setting value %s." % ( argName, self.methodName, methDefaultArgs[argName] ) )
+        kwargs[argName] = methDefaultArgs[argName]
+
+
+    if type( lfn ) in StringTypes:
+      lfnDict = {lfn:False}
+    elif type( lfn ) == ListType:
+      lfnDict = {}
+      for url in lfn:
+        lfnDict[url] = False
+    elif type( lfn ) == DictType:
+      lfnDict = lfn.copy()
     else:
-      errStr = "StorageElement.__executeFunction: Supplied pfns must be string or list of strings or a dictionary."
-      gLogger.error( errStr )
+      errStr = "StorageElement.__executeMethod: Supplied lfns must be string, list of strings or a dictionary."
+      self.log.debug( errStr )
       return S_ERROR( errStr )
 
-    if not pfns:
-      gLogger.verbose( "StorageElement.__executeFunction: No pfns supplied." )
-      return S_OK( {'Failed':{}, 'Successful':{}} )
-    gLogger.verbose( "StorageElement.__executeFunction: Attempting to perform '%s' operation with %s pfns." % ( method, len( pfns ) ) )
+    self.log.verbose( "StorageElement.__executeMethod: Attempting to perform '%s' operation with %s lfns." % ( self.methodName,
+                                                                                                  len( lfnDict ) ) )
 
-    if not self.overwride:
-      res = self.isValid( operation = method )
-      if not res['OK']:
-        return res
+    res = self.isValid( operation = self.methodName )
+    if not res['OK']:
+      return res
     else:
       if not self.valid:
         return S_ERROR( self.errorReason )
-
 
     successful = {}
     failed = {}
@@ -587,91 +791,90 @@ class StorageElement:
       res = storage.getParameters()
       useProtocol = True
       if not res['OK']:
-        gLogger.error( "StorageElement.__executeFunction: Failed to get storage parameters.", "%s %s" % ( self.name, res['Message'] ) )
+        self.log.debug( "StorageElement.__executeMethod: Failed to get storage parameters.", "%s %s" % ( self.name,
+                                                                                            res['Message'] ) )
         useProtocol = False
       else:
         protocolName = res['Value']['ProtocolName']
-        if not pfns:
+        if not lfnDict:
           useProtocol = False
-          gLogger.verbose( "StorageElement.__executeFunction: No pfns to be attempted for %s protocol." % protocolName )
+          self.log.debug( "StorageElement.__executeMethod: No lfns to be attempted for %s protocol." % protocolName )
         elif not ( protocolName in self.remoteProtocols ) and not localSE:
           # If the SE is not local then we can't use local protocols
           useProtocol = False
-          gLogger.verbose( "StorageElement.__executeFunction: Protocol not appropriate for use: %s." % protocolName )
+          self.log.debug( "StorageElement.__executeMethod: Local protocol not appropriate for remote use: %s." % protocolName )
       if useProtocol:
-        gLogger.verbose( "StorageElement.__executeFunction: Generating %s protocol PFNs for %s." % ( len( pfns ), protocolName ) )
-        res = self.__generatePfnDict( pfns.keys(), storage, failed )
-        pfnDict = res['Value']
-        failed = res['Failed']
-        if not len( pfnDict.keys() ) > 0:
-          gLogger.verbose( "StorageElement.__executeFunction No pfns generated for protocol %s." % protocolName )
+        self.log.verbose( "StorageElement.__executeMethod: Generating %s protocol PFNs for %s." % ( len( lfnDict ),
+                                                                                       protocolName ) )
+        res = self.__generatePfnDict( lfnDict, storage )
+        pfnDict = res['Value']  # pfn : lfn
+        failed.update( res['Failed'] )
+        if not len( pfnDict ):
+          self.log.verbose( "StorageElement.__executeMethod No pfns generated for protocol %s." % protocolName )
         else:
-          gLogger.verbose( "StorageElement.__executeFunction: Attempting to perform '%s' for %s physical files." % ( method, len( pfnDict.keys() ) ) )
-          pfnsToUse = {}
-          for pfn in pfnDict.keys():
-            pfnsToUse[pfn] = pfns[pfnDict[pfn]]
-          if argsDict:
-            execString = "res = storage.%s(pfnsToUse" % method
-            for argument, value in argsDict.items():
-              if type( value ) == types.StringType:
-                execString = "%s, %s='%s'" % ( execString, argument, value )
-              else:
-                execString = "%s, %s=%s" % ( execString, argument, value )
-            execString = "%s)" % execString
-          else:
-            execString = "res = storage.%s(pfnsToUse)" % method
-          try:
-            exec( execString )
-          except AttributeError, errMessage:
-            exceptStr = "StorageElement.__executeFunction: Exception while performing %s." % method
-            gLogger.exception( exceptStr, str( errMessage ) )
-            res = S_ERROR( exceptStr )
+          self.log.verbose( "StorageElement.__executeMethod: Attempting to perform '%s' for %s physical files" % ( self.methodName,
+                                                                                                      len( pfnDict ) ) )
+          fcn = None
+          if hasattr( storage, self.methodName ) and callable( getattr( storage, self.methodName ) ):
+            fcn = getattr( storage, self.methodName )
+          if not fcn:
+            return S_ERROR( "StorageElement.__executeMethod: unable to invoke %s, it isn't a member function of storage" )
+
+          pfnsToUse = {}  # pfn : the value of the lfn dictionary for the lfn of this pfn
+          for pfn in pfnDict:
+            pfnsToUse[pfn] = lfnDict[pfnDict[pfn]]
+
+          res = fcn( pfnsToUse, *args, **kwargs )
 
           if not res['OK']:
-            errStr = "StorageElement.__executeFunction: Completely failed to perform %s." % method
-            gLogger.error( errStr, '%s for protocol %s: %s' % ( self.name, protocolName, res['Message'] ) )
-            for pfn in pfnDict.values():
-              if not failed.has_key( pfn ):
-                failed[pfn] = ''
-              failed[pfn] = "%s %s" % ( failed[pfn], res['Message'] )
+            errStr = "StorageElement.__executeMethod: Completely failed to perform %s." % self.methodName
+            self.log.debug( errStr, '%s for protocol %s: %s' % ( self.name, protocolName, res['Message'] ) )
+            for lfn in pfnDict.values():
+              if lfn not in failed:
+                failed[lfn] = ''
+              failed[lfn] += " %s" % ( res['Message'] )  # Concatenate! Not '=' :-)
           else:
-            for protocolPfn, pfn in pfnDict.items():
-              if not res['Value']['Successful'].has_key( protocolPfn ):
-                if not failed.has_key( pfn ):
-                  failed[pfn] = ''
-                if res['Value']['Failed'].has_key( protocolPfn ):
-                  failed[pfn] = "%s %s" % ( failed[pfn], res['Value']['Failed'][protocolPfn] )
+            for pfn, lfn in pfnDict.items():
+              if pfn not in res['Value']['Successful']:
+                if lfn not in failed:
+                  failed[lfn] = ''
+                if pfn in res['Value']['Failed']:
+                  failed[lfn] = "%s %s" % ( failed[lfn], res['Value']['Failed'][pfn] )
                 else:
-                  failed[pfn] = "%s %s" % ( failed[pfn], 'No error returned from plug-in' )
+                  failed[lfn] = "%s %s" % ( failed[lfn], 'No error returned from plug-in' )
               else:
-                successful[pfn] = res['Value']['Successful'][protocolPfn]
-                if failed.has_key( pfn ):
-                  failed.pop( pfn )
-                pfns.pop( pfn )
+                successful[lfn] = res['Value']['Successful'][pfn]
+                if lfn in failed:
+                  failed.pop( lfn )
+                lfnDict.pop( lfn )
 
-    resDict = {'Failed':failed, 'Successful':successful}
-    return S_OK( resDict )
 
-  def __generatePfnDict( self, pfns, storage, failed ):
-    pfnDict = {}
-    for pfn in pfns:
-      res = pfnparse( pfn )
-      if not res['OK']:
-        errStr = "StorageElement.__generatePfnDict: Failed to parse supplied PFN."
-        gLogger.error( errStr, "%s: %s" % ( pfn, res['Message'] ) )
-        if not failed.has_key( pfn ):
-          failed[pfn] = ''
-        failed[pfn] = "%s %s" % ( failed[pfn], errStr )
-      else:
-        res = storage.getProtocolPfn( res['Value'], True )
-        if not res['OK']:
-          errStr = "StorageElement.__generatePfnDict %s." % res['Message']
-          gLogger.error( errStr, 'for %s' % ( pfn ) )
-          if not failed.has_key( pfn ):
-            failed[pfn] = ''
-          failed[pfn] = "%s %s" % ( failed[pfn], errStr )
-        else:
-          pfnDict[res['Value']] = pfn
-    res = S_OK( pfnDict )
-    res['Failed'] = failed
-    return res
+    # Ensure backward compatibility for singleFile and singleDirectory for the time of a version
+    singleFileOrDir = removedArgs.get( "singleFile", False ) or removedArgs.get( "singleDirectory", False )
+
+    retValue = S_OK( { 'Failed': failed, 'Successful': successful } )
+
+    if singleFileOrDir:
+      self.log.verbose( "StorageElement.__executeMethod : use Utils.executeSingleFileOrDirWrapper for backward compatibility. You should fix your code " )
+      retValue = Utils.executeSingleFileOrDirWrapper( retValue )
+
+    return retValue
+
+
+
+  def __getattr__( self, name ):
+    """ Forwards the equivalent Storage calls to StorageElement.__executeMethod"""
+    # We take either the equivalent name, or the name itself
+    self.methodName = StorageElement.__equivalentMethodNames.get( name, None )
+
+    if self.methodName:
+      return self.__executeMethod
+
+    raise AttributeError
+
+
+
+
+
+
+

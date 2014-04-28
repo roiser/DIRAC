@@ -8,55 +8,19 @@ __RCSID__ = "$Id$"
 import cmd
 import sys
 import pprint
-import getpass
+import os
 from DIRAC.Core.Utilities.ColorCLI import colorize
 from DIRAC.FrameworkSystem.Client.SystemAdministratorClient import SystemAdministratorClient
+from DIRAC.FrameworkSystem.Client.SystemAdministratorIntegrator import SystemAdministratorIntegrator
 import DIRAC.Core.Utilities.InstallTools as InstallTools
 from DIRAC.ConfigurationSystem.Client.Helpers import getCSExtensions
 from DIRAC.Core.Utilities import List
 from DIRAC import gConfig
-
-def printTable( fields, records ):
-  """ Utility function to pretty print table data
-  """
-  if not records:
-    print "No output"
-    return
-
-  nFields = len( fields )
-  if nFields != len( records[0] ):
-    print "Incorrect data structure to print"
-    return
-
-  lengths = []
-  for i in range( nFields ):
-    lengths.append( len( fields[i] ) )
-    for r in records:
-      if len( r[i] ) > lengths[i]:
-        lengths[i] = len( r[i] )
-
-  totalLength = 0
-  for i in lengths:
-    totalLength += i
-    totalLength += 2
-
-  print ' ' * 3,
-  for i in range( nFields ):
-    print fields[i].ljust( lengths[i] + 1 ),
-  print
-  print '=' * totalLength
-  count = 1
-  for r in records:
-    print str( count ).rjust( 3 ),
-    for i in range( nFields ):
-      print r[i].ljust( lengths[i] + 1 ),
-    print
-    count += 1
+from DIRAC.Core.Utilities.PrettyPrint import printTable
 
 class SystemAdministratorClientCLI( cmd.Cmd ):
-  """ 
   """
-
+  """
   def __errMsg( self, errMsg ):
     print "%s %s" % ( colorize( "[ERROR]", "red" ), errMsg )
 
@@ -65,9 +29,10 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
     # Check if Port is given
     self.host = None
     self.port = None
-    self.prompt = '(%s)> ' % colorize( "no host", "yellow" )
+    self.prompt = '[%s]> ' % colorize( "no host", "yellow" )
     if host:
       self.__setHost( host )
+    self.cwd = ''  
 
   def __setHost( self, host ):
     hostList = host.split( ':' )
@@ -83,7 +48,7 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
     else:
       self.__errMsg( "Could not connect to %s: %s" % ( self.host, result[ 'Message' ] ) )
       colorHost = colorize( host, "red" )
-    self.prompt = '(%s)> ' % colorHost
+    self.prompt = '[%s]> ' % colorHost
 
   def __getClient( self ):
     return SystemAdministratorClient( self.host, self.port )
@@ -91,9 +56,9 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
   def do_set( self, args ):
     """
         Set options
-    
+
         usage:
-        
+
           set host <hostname>     - Set the hostname to work with
           set project <project>   - Set the project to install/upgrade in the host
     """
@@ -116,7 +81,7 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
 
   def __do_set_host( self, args ):
     host = args[0]
-    if host.find( '.' ) == -1:
+    if host.find( '.' ) == -1 and host != "localhost":
       self.__errMsg( "Provide the full host name including its domain" )
       return
     self.__setHost( host )
@@ -131,11 +96,11 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
 
 
   def do_show( self, args ):
-    """ 
+    """
         Show list of components with various related information
-        
+
         usage:
-    
+
           show software      - show components for which software is available
           show installed     - show components installed in the host with runit system
           show setup         - show components set up for automatic running in the host
@@ -146,7 +111,8 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
           show log  <system> <service|agent> [nlines]
                              - show last <nlines> lines in the component log file
           show info          - show version of software and setup
-          show errors [*|<system> <service|agent>] 
+          show host          - show host related parameters
+          show errors [*|<system> <service|agent>]
                              - show error count for the given component or all the components
                                in the last hour and day
     """
@@ -195,27 +161,31 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
       if not result['OK']:
         self.__errMsg( result['Message'] )
       else:
+        fields = ["System",'Name','Module','Type','Setup','Installed','Runit','Uptime','PID']
+        records = []
         rDict = result['Value']
-        print
-        print "   System", ' ' * 20, 'Name', ' ' * 15, 'Type', ' ' * 13, 'Setup    Installed   Runit    Uptime    PID'
-        print '-' * 116
         for compType in rDict:
           for system in rDict[compType]:
-            for component in rDict[compType][system]:
+            components = rDict[compType][system].keys()
+            components.sort()
+            for component in components:
+              record = []
               if rDict[compType][system][component]['Installed']:
-                print  system.ljust( 28 ), component.ljust( 28 ), compType.lower()[:-1].ljust( 7 ),
+                module = str( rDict[compType][system][component]['Module'] )
+                record += [ system,component,module,compType.lower()[:-1]]
                 if rDict[compType][system][component]['Setup']:
-                  print 'SetUp'.rjust( 12 ),
+                  record += ['Setup']
                 else:
-                  print 'NotSetup'.rjust( 12 ),
+                  record += ['NotSetup']
                 if rDict[compType][system][component]['Installed']:
-                  print 'Installed'.rjust( 12 ),
+                  record += ['Installed']
                 else:
-                  print 'NotInstalled'.rjust( 12 ),
-                print str( rDict[compType][system][component]['RunitStatus'] ).ljust( 7 ),
-                print str( rDict[compType][system][component]['Timeup'] ).rjust( 7 ),
-                print str( rDict[compType][system][component]['PID'] ).rjust( 8 ),
-                print
+                  record += ['NotInstalled']
+                record += [str( rDict[compType][system][component]['RunitStatus'] )]
+                record += [str( rDict[compType][system][component]['Timeup'] )]
+                record += [str( rDict[compType][system][component]['PID'] )]
+                records.append(record)  
+        printTable(fields,records)        
     elif option == 'database' or option == 'databases':
       client = SystemAdministratorClient( self.host, self.port )
       if not InstallTools.mysqlPassword:
@@ -266,6 +236,23 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
           for e, v in result['Value']['Extensions'].items():
             print "%s version" % e, v
         print
+    elif option == "host":
+      client = SystemAdministratorClient( self.host, self.port )
+      result = client.getHostInfo()
+      if not result['OK']:
+        self.__errMsg( result['Message'] )
+      else:   
+        print   
+        print "Host info:"
+        print
+        
+        fields = ['Parameter','Value']
+        records = []
+        for key,value in result['Value'].items():
+          records.append( [key, str(value) ] )
+          
+        printTable( fields, records )  
+            
     elif option == "errors":
       self.getErrors( argss )
     else:
@@ -334,15 +321,16 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
       print "No logs found"
 
   def do_install( self, args ):
-    """ 
-        Install various DIRAC components 
-    
+    """
+        Install various DIRAC components
+
         usage:
-        
+
           install mysql
           install db <database>
-          install service <system> <service>
-          install agent <system> <agent>
+          install service <system> <service> [-m <ModuleName>] [-p <Option>=<Value>] [-p <Option>=<Value>] ...
+          install agent <system> <agent> [-m <ModuleName>] [-p <Option>=<Value>] [-p <Option>=<Value>] ...
+          install executor <system> <executor> [-m <ModuleName>] [-p <Option>=<Value>] [-p <Option>=<Value>] ...
     """
     argss = args.split()
     if not argss:
@@ -407,13 +395,28 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
         self.__errMsg( result['Message'] )
         return
       print "Database %s from %s/%s installed successfully" % ( database, extension, system )
-    elif option == "service" or option == "agent":
+    elif option in ["service","agent","executor"] :
       if len( argss ) < 2:
         print self.do_install.__doc__
         return
 
       system = argss[0]
-      component = argss[1]
+      del argss[0]
+      component = argss[0]
+      del argss[0]
+      
+      specialOptions = {}
+      module = ''
+      for i in range(len(argss)):
+        if argss[i] == "-m":
+          specialOptions['Module'] = argss[i+1]
+          module = argss[i+1]
+        if argss[i] == "-p":
+          opt,value = argss[i+1].split('=')
+          specialOptions[opt] = value           
+      if module == component:
+        module = ''
+      
       client = SystemAdministratorClient( self.host, self.port )
       # First need to update the CS
       # result = client.addDefaultOptionsToCS( option, system, component )
@@ -423,12 +426,25 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
         self.__errMsg( result['Message'] )
         return
       hostSetup = result['Value']['Setup']
-      result = InstallTools.addDefaultOptionsToCS( gConfig, option, system, component, getCSExtensions(), hostSetup )
+      
+      # Install Module section if not yet there
+      if module:
+        result = InstallTools.addDefaultOptionsToCS( gConfig, option, system, module, 
+                                                     getCSExtensions(), hostSetup )
+        # Add component section with specific parameters only
+        result = InstallTools.addDefaultOptionsToCS( gConfig, option, system, component, 
+                                                     getCSExtensions(), hostSetup, specialOptions, 
+                                                     addDefaultOptions = False )
+      else:  
+        # Install component section
+        result = InstallTools.addDefaultOptionsToCS( gConfig, option, system, component, 
+                                                     getCSExtensions(), hostSetup, specialOptions )
+    
       if not result['OK']:
         self.__errMsg( result['Message'] )
         return
       # Then we can install and start the component
-      result = client.setupComponent( option, system, component )
+      result = client.setupComponent( option, system, component, module )
       if not result['OK']:
         self.__errMsg( result['Message'] )
         return
@@ -438,11 +454,33 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
     else:
       print "Unknown option:", option
 
-  def do_start( self, args ):
-    """ Start services or agents or database server    
-      
+  def do_uninstall( self, args ):
+    """
+        Uninstall DIRAC component
+
         usage:
-        
+
+          uninstall <system> <component>
+    """
+    argss = args.split()
+    if not argss or len(argss) != 2:
+      print self.do_uninstall.__doc__
+      return
+    
+    system,component = argss
+    client = SystemAdministratorClient( self.host, self.port )
+    result = client.uninstallComponent( system, component )
+    if not result['OK']:
+      print "Error:", result['Message']
+    else:
+      print "Successfully uninstalled %s/%s" % (system,component)  
+    
+
+  def do_start( self, args ):
+    """ Start services or agents or database server
+
+        usage:
+
           start <system|*> <service|agent|*>
           start mysql
     """
@@ -477,10 +515,10 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
       print "Not yet implemented"
 
   def do_restart( self, args ):
-    """ Restart services or agents or database server    
-      
+    """ Restart services or agents or database server
+
         usage:
-        
+
           restart <system|*> <service|agent|*>
           restart mysql
     """
@@ -515,10 +553,10 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
       print "Not yet implemented"
 
   def do_stop( self, args ):
-    """ Stop services or agents or database server    
-      
+    """ Stop services or agents or database server
+
         usage:
-        
+
           stop <system|*> <service|agent|*>
           stop mysql
     """
@@ -545,16 +583,43 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
 
   def do_update( self, args ):
     """ Update the software on the target host to a given version
-    
+
         usage:
+
+          update <version> [ -r <rootPath> ] [ -g <lcgVersion> ]
           
-          update <version> 
+              where rootPath - path to the DIRAC installation
+                    lcgVersion - version of the LCG bindings to install
     """
     argss = args.split()
     version = argss[0]
+    rootPath = ''
+    lcgVersion = ''
+    del argss[0]
+    try:
+      while len( argss ) > 0:
+        if argss[0] == '-r':
+          rootPath = argss[1]
+          del argss[0]
+          del argss[0]
+        elif argss[0] == '-g':
+          lcgVersion = argss[1]  
+          del argss[0]
+          del argss[0]
+    except Exception, x:
+      print "ERROR: wrong input:", str(x)
+      print """usage:
+
+          update <version> [ -r <rootPath> ] [ -g <lcgVersion> ]
+          
+              where rootPath - path to the DIRAC installation
+                    lcgVersion - version of the LCG bindings to install
+"""           
+      return  
+    
     client = SystemAdministratorClient( self.host, self.port )
     print "Software update can take a while, please wait ..."
-    result = client.updateSoftware( version )
+    result = client.updateSoftware( version, rootPath, lcgVersion )
     if not result['OK']:
       self.__errMsg( "Failed to update the software" )
       print result['Message']
@@ -563,12 +628,26 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
       print "You should restart the services to use the new software version."
       print "Think of updating /Operation/<vo>/<setup>/Versions section in the CS"
 
-  def do_add( self, args ):
-    """ 
-        Add new entity to the Configuration Service
+  def do_revert( self, args ):
+    """ Revert the last installed version of software to the previous one
     
         usage:
         
+            revert
+    """ 
+    client = SystemAdministratorClient( self.host, self.port )
+    result = client.revertSoftware()
+    if not result['OK']:
+      print "Error:", result['Message']
+    else:
+      print "Software reverted to", result['Value']  
+
+  def do_add( self, args ):
+    """
+        Add new entity to the Configuration Service
+
+        usage:
+
           add system <system> <instance>
     """
     argss = args.split()
@@ -599,15 +678,17 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
 
   def do_exec( self, args ):
     """ Execute a shell command on the remote host and get back the output
-    
+
         usage:
-        
+
           exec <cmd> [<arguments>]
     """
     client = SystemAdministratorClient( self.host, self.port )
-    result = client.executeCommand( args )
+    command = 'cd %s;' % self.cwd + args
+    result = client.executeCommand( command )
     if not result['OK']:
       self.__errMsg( result['Message'] )
+      return
     status, output, error = result['Value']
     print
     for line in output.split( '\n' ):
@@ -619,9 +700,9 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
 
   def do_execfile( self, args ):
     """ Execute a series of administrator CLI commands from a given file
-    
+
         usage:
-        
+
           execfile <filename>
     """
     argss = args.split()
@@ -641,6 +722,138 @@ class SystemAdministratorClientCLI( cmd.Cmd ):
       command = elements[0]
       args = ' '.join( elements[1:] )
       eval( "self.do_%s(args)" % command )
+      
+  def do_cd( self, args ):    
+    """ Change the current working directory on the target host
+    
+        Usage:
+          cd <dirpath>
+    """
+    argss = args.split()
+    newPath = argss[0]
+    if newPath.startswith( '/' ):
+      self.cwd = newPath
+    else:
+      newPath = self.cwd + '/' + newPath
+      self.cwd = os.path.normpath( newPath )  
+    self.prompt = '[%s:%s]> ' % ( self.host, self.cwd )  
+
+  def do_showall( self, args ):
+    """ Show status of all the components in all the hosts
+    
+        Usage:
+          showall [-snmth] [-ASE] [-N name] [-H host] - show status of components
+                              
+        Options:
+            -d extra debug printout
+          Sorting options:                      
+            -s system
+            -n component name
+            -m component module
+            -t component type
+            -h component host  
+          Selection options:
+            -A select agents
+            -S select services
+            -E select executors
+            -N <component pattern> select component with the name containing the pattern 
+            -H <host name> select the given host  
+            -T <setup name> select the given setup
+    """
+    
+    argss = args.split()
+    sortOption = ''
+    componentType = ''
+    componentName = ''
+    hostName = ''
+    setupName = ''
+    debug = False
+    while len( argss ) > 0:
+      option = argss[0]
+      del argss[0]
+      sortOption = ''
+      if option == '-s':
+        sortOption = "System"
+      elif option == '-n':
+        sortOption = "Name" 
+      elif option == '-m':
+        sortOption = "Module"
+      elif option == '-t':
+        sortOption = "Type"
+      elif option == '-h':
+        sortOption = "Host"
+      elif option == "-A":
+        componentType = 'Agents'
+      elif option == "-S":
+        componentType = 'Services'
+      elif option == "-E":
+        componentType = 'Executors'
+      elif option == "-d":
+        debug = True  
+      elif option == "-N":
+        componentName = argss[0]        
+        del argss[0]      
+      elif option == "-H":
+        hostName = argss[0]        
+        del argss[0]   
+      elif option == "-T":
+        setupName = argss[0]        
+        del argss[0]     
+      else:
+        self.__errMsg( 'Invalid option %s' % option )  
+        return
+    
+    client = SystemAdministratorIntegrator()
+    resultAll = client.getOverallStatus()
+    resultInfo = client.getInfo()
+    
+    if not resultAll['OK']:
+      self.__errMsg( resultAll['Message'] )
+    else:
+      fields = ["System",'Name','Module','Type','Setup','Host','Runit','Uptime']
+      records = []
+      for host in resultAll['Value']:
+        if hostName and not hostName in host:
+          continue
+        result = resultAll['Value'][host]
+        if not result['OK']:
+          if debug:
+            self.__errMsg( "Host %s: %s" % (host,result['Message']) )
+          continue  
+        rDict = result['Value']
+        for compType in rDict:
+          if componentType and componentType != compType:
+            continue
+          for system in rDict[compType]:
+            components = rDict[compType][system].keys()
+            components.sort()
+            for component in components:
+              if componentName and not componentName in component:
+                continue
+              record = []
+              if rDict[compType][system][component]['Installed']:
+                module = str( rDict[compType][system][component]['Module'] )
+                record += [ system,component,module,compType.lower()[:-1]]
+                if resultInfo['OK'] and host in resultInfo['Value'] and resultInfo['Value'][host]['OK']:
+                  setup = resultInfo['Value'][host]['Value']['Setup']
+                else:
+                  setup = 'Unknown'
+                if setupName and not setupName in setup:
+                  continue  
+                record += [setup]    
+                record += [host]  
+                record += [str( rDict[compType][system][component]['RunitStatus'] )]
+                record += [str( rDict[compType][system][component]['Timeup'] )]
+                records.append(record)  
+      printTable( fields, records, sortOption )        
+
+  def default( self, args ):
+
+    argss = args.split()
+    command = argss[0]
+    if command in ['ls','cat','pwd','chown','chmod','chgrp',
+                   'id','date','uname','cp','mv','scp']:
+      self.do_exec( args )
 
   def do_exit( self, args ):
     """ Exit the shell.

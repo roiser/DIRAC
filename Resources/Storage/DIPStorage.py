@@ -1,7 +1,3 @@
-########################################################################
-# $Id$
-########################################################################
-
 """ DIPStorage class is the client of the DIRAC Storage Element.
 
     The following methods are available in the Service interface
@@ -18,12 +14,13 @@
 __RCSID__ = "$Id$"
 
 from DIRAC                                          import gLogger, S_OK, S_ERROR
+from DIRAC.Resources.Utilities.Utils                import checkArgumentFormat
 from DIRAC.Resources.Storage.StorageBase            import StorageBase
 from DIRAC.Core.Utilities.Pfn                       import pfnparse, pfnunparse
 from DIRAC.Core.DISET.TransferClient                import TransferClient
 from DIRAC.Core.DISET.RPCClient                     import RPCClient
 from DIRAC.Core.Utilities.File                      import getSize
-import os, types
+import os, types, random
 
 class DIPStorage( StorageBase ):
 
@@ -39,14 +36,27 @@ class DIPStorage( StorageBase ):
     self.protocol = protocol
     self.path = path
     self.host = host
-    self.port = port
+
+    # Several ports can be specified as comma separated list, choose
+    # randomly one of those ports
+    ports = port.split( ',' )
+    random.shuffle( ports )
+    self.port = ports[0]
+
     self.wspath = wspath
     self.spaceToken = spaceToken
 
-    self.url = protocol + "://" + host + ":" + port + wspath
-
+    self.url = protocol + "://" + host + ":" + self.port + wspath
     self.cwd = ''
+    self.checkSum = "CheckSum"
     self.isok = True
+
+  def setParameters( self, parameters ):
+    """ Applying extra storage parameters
+    """
+    if "CheckSum" in parameters and parameters['CheckSum'].lower() in ['no', 'false', 'off']:
+      self.checkSum = "NoCheckSum"
+    return S_OK()
 
   ################################################################################
   #
@@ -164,7 +174,7 @@ class DIPStorage( StorageBase ):
   def putFile( self, path, sourceSize = 0 ):
     """Put a file to the physical storage
     """
-    res = self.__checkArgumentFormatDict( path )
+    res = checkArgumentFormat( path )
     if not res['OK']:
       return res
     urls = res['Value']
@@ -205,7 +215,7 @@ class DIPStorage( StorageBase ):
       gLogger.error( errStr, src_file )
       return S_ERROR( errStr )
     transferClient = TransferClient( self.url )
-    res = transferClient.sendFile( src_file, dest_url )
+    res = transferClient.sendFile( src_file, dest_url, token = self.checkSum )
     if localCache:
       os.unlink( src_file )
     if res['OK']:
@@ -239,7 +249,7 @@ class DIPStorage( StorageBase ):
 
   def __getFile( self, src_url, dest_file ):
     transferClient = TransferClient( self.url )
-    res = transferClient.receiveFile( dest_file, src_url )
+    res = transferClient.receiveFile( dest_file, src_url, token = self.checkSum )
     if not res['OK']:
       return res
     if not os.path.exists( dest_file ):
@@ -492,7 +502,7 @@ class DIPStorage( StorageBase ):
   def putDirectory( self, path ):
     """ Put a local directory to the physical storage together with all its files and subdirectories.
     """
-    res = self.__checkArgumentFormatDict( path )
+    res = checkArgumentFormat( path )
     if not res['OK']:
       return res
     urls = res['Value']
@@ -573,32 +583,32 @@ class DIPStorage( StorageBase ):
       return S_ERROR( "DIPStorage.__checkArgumentFormat: Supplied path is not of the correct format." )
     return S_OK( urls )
 
-  def __checkArgumentFormatDict( self, path ):
-    if type( path ) in types.StringTypes:
-      urls = {path:False}
-    elif type( path ) == types.ListType:
-      urls = {}
-      for url in path:
-        urls[url] = False
-    elif type( path ) == types.DictType:
-      urls = path
-    else:
-      return S_ERROR( "DIPStorage.checkArgumentFormat: Supplied path is not of the correct format." )
-    return S_OK( urls )
-
   def __executeOperation( self, url, method ):
     """ Executes the requested functionality with the supplied url
     """
-    execString = "res = self.%s(url)" % method
-    try:
-      exec( execString )
-      if not res['OK']:
-        return S_ERROR( res['Message'] )
-      elif not res['Value']['Successful'].has_key( url ):
-        return S_ERROR( res['Value']['Failed'][url] )
-      else:
-        return S_OK( res['Value']['Successful'][url] )
-    except AttributeError, errMessage:
-      exceptStr = "DIPStorage.__executeOperation: Exception while perfoming %s." % method
-      gLogger.exception( exceptStr, '', errMessage )
-      return S_ERROR( "%s%s" % ( exceptStr, errMessage ) )
+    fcn = None
+    if hasattr( self, method ) and callable( getattr( self, method ) ):
+      fcn = getattr( self, method )
+    if not fcn:
+      return S_ERROR( "Unable to invoke %s, it isn't a member function of DIPStorage" % method )
+
+    res = fcn( url )
+    if not res['OK']:
+      return res
+    elif url not in res['Value']['Successful']:
+      return S_ERROR( res['Value']['Failed'][url] )
+
+    return S_OK( res['Value']['Successful'][url] )
+
+  def getCurrentStatus(self):
+    """ Ask the server the current status (disk usage). Needed for RSS
+    """
+    serviceClient = RPCClient( self.url )
+    res = serviceClient.getAdminInfo()
+    if not res['OK']:
+      return res
+    se_status = {}
+    se_status['totalsize'] = res['Value']['AvailableSpace'] + res['Value']['UsedSpace']
+    se_status['unusedsize'] = res['Value']['AvailableSpace']
+    se_status['guaranteedsize'] = res['Value']['MaxCapacity']
+    return S_OK(se_status)

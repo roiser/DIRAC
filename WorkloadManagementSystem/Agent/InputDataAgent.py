@@ -1,8 +1,3 @@
-########################################################################
-# $HeadURL$
-# File :    InputDataAgent.py
-# Author :  Stuart Paterson
-########################################################################
 """   
   The Input Data Agent queries the file catalog for specified job input data and adds the
   relevant information to the job optimizer parameters to be used during the
@@ -11,12 +6,16 @@
 __RCSID__ = "$Id$"
 
 from DIRAC.WorkloadManagementSystem.Agent.OptimizerModule  import OptimizerModule
-from DIRAC.Resources.Storage.StorageElement                import StorageElement
 
 from DIRAC.Core.Utilities.SiteSEMapping                    import getSitesForSE
 from DIRAC.Core.Utilities.List                             import uniqueElements
 from DIRAC                                                 import S_OK, S_ERROR
-from DIRAC.DataManagementSystem.Client.ReplicaManager      import ReplicaManager
+from DIRAC.ConfigurationSystem.Client.Helpers.Resources    import Resources
+from DIRAC.DataManagementSystem.Client.DataManager         import DataManager
+from DIRAC.Resources.Catalog.FileCatalog                   import FileCatalog
+from DIRAC.ConfigurationSystem.Client.Helpers.Resources    import getStorageElementOptions
+from DIRAC.ResourceStatusSystem.Client.ResourceStatus      import ResourceStatus
+
 import time
 
 class InputDataAgent( OptimizerModule ):
@@ -41,15 +40,19 @@ class InputDataAgent( OptimizerModule ):
     self.am_setOption( 'shifterProxy', 'ProductionManager' )
 
     try:
-      self.replicaManager = ReplicaManager()
+      self.dataManager = DataManager()
     except Exception, e:
-      msg = 'Failed to create ReplicaManager'
+      msg = 'Failed to create DataManager'
       self.log.exception( msg )
       return S_ERROR( msg + str( e ) )
-
+    
+    self.resourceStatus  = ResourceStatus()
+    self.resourcesHelper = Resources()
+    self.fc = FileCatalog()
     self.seToSiteMapping = {}
     self.lastCScheck = 0
     self.cacheLength = 600
+    
 
     return S_OK()
 
@@ -72,27 +75,16 @@ class InputDataAgent( OptimizerModule ):
     #Check if we already executed this Optimizer and the input data is resolved
     res = self.getOptimizerJobInfo( job, self.am_getModuleParam( 'optimizerName' ) )
     if res['OK'] and len( res['Value'] ):
-      resolvedData = res['Value']
+      pass
     else:
-
       self.log.verbose( 'Job %s has an input data requirement and will be processed' % ( job ) )
       inputData = result['Value']
       result = self.__resolveInputData( job, inputData )
       if not result['OK']:
         self.log.warn( result['Message'] )
         return result
-      resolvedData = result['Value']
-
-    #Now check if banned SE's might prevent jobs to be scheduled
-    result = self.__checkActiveSEs( job, resolvedData['Value']['Value'] )
-    if not result['OK']:
-      # if after checking SE's input data can not be resolved any more
-      # then keep the job in the same status and update the application status
-      result = self.jobDB.setJobStatus( job, application = result['Message'] )
-      return S_OK()
 
     return self.setNextOptimizer( job )
-
 
   #############################################################################
   def __resolveInputData( self, job, inputData ):
@@ -103,7 +95,7 @@ class InputDataAgent( OptimizerModule ):
     start = time.time()
     # In order to place jobs on Hold if a certain SE is banned we need first to check first if
     # if the replicas are really available
-    replicas = self.replicaManager.getReplicas( lfns )
+    replicas = self.dataManager.getActiveReplicas( lfns )
     timing = time.time() - start
     self.log.verbose( 'Catalog Replicas Lookup Time: %.2f seconds ' % ( timing ) )
     if not replicas['OK']:
@@ -121,7 +113,7 @@ class InputDataAgent( OptimizerModule ):
     if self.checkFileMetadata:
       guids = True
       start = time.time()
-      guidDict = self.replicaManager.getCatalogFileMetadata( lfns )
+      guidDict = self.fc.getFileMetadata( lfns )
       timing = time.time() - start
       self.log.info( 'Catalog Metadata Lookup Time: %.2f seconds ' % ( timing ) )
 
@@ -184,7 +176,7 @@ class InputDataAgent( OptimizerModule ):
     the execution of the job
     """
     # Now let's check if some replicas might not be available due to banned SE's
-    activeReplicas = self.replicaManager.checkActiveReplicas( replicaDict )
+    activeReplicas = self.dataManager.checkActiveReplicas( replicaDict )
     if not activeReplicas['OK']:
       # due to banned SE's input data might no be available
       msg = "On Hold: Missing replicas due to banned SE"
@@ -251,7 +243,7 @@ class InputDataAgent( OptimizerModule ):
 
     siteCandidates = []
     i = 0
-    for fileName, sites in fileSEs.items():
+    for _fileName, sites in fileSEs.items():
       if not i:
         siteCandidates = sites
       else:
@@ -279,19 +271,26 @@ class InputDataAgent( OptimizerModule ):
           if not sites['OK']:
             continue
           try:
-            storageElement = StorageElement( se )
-            seDict[se] = { 'Sites': sites['Value'], 'Status': storageElement.getStatus()['Value'] }
+            #storageElement = StorageElement( se )
+            result = self.resourceStatus.getStorageStatus( se, statusType = 'ReadAccess' )
+            if not result['OK']:
+              continue
+            seDict[se] = { 'Sites': sites['Value'], 'SEParams': result['Value'][se] }
+            result = self.resourcesHelper.getStorageElementOptionsDict( se )
+            if not result['OK']:
+              continue
+            seDict[se]['SEParams'].update(result['Value'])
           except Exception:
             self.log.exception( 'Failed to instantiate StorageElement( %s )' % se )
             continue
         for site in seDict[se]['Sites']:
           if site in siteCandidates:
-            if seDict[se]['Status']['Read'] and seDict[se]['Status']['DiskSE']:
+            if seDict[se]['SEParams']['ReadAccess'] and seDict[se]['SEParams']['DiskSE']:
               if lfn not in siteResult[site]['disk']:
                 siteResult[site]['disk'].append( lfn )
                 if lfn in siteResult[site]['tape']:
                   siteResult[site]['tape'].remove( lfn )
-            if seDict[se]['Status']['Read'] and seDict[se]['Status']['TapeSE']:
+            if seDict[se]['SEParams']['ReadAccess'] and seDict[se]['SEParams']['TapeSE']:
               if lfn not in siteResult[site]['tape'] and lfn not in siteResult[site]['disk']:
                 siteResult[site]['tape'].append( lfn )
 

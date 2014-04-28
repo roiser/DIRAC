@@ -4,6 +4,7 @@
 ########################################################################
 __RCSID__   = "$Id$"
 
+from DIRAC           import exit as DIRACExit
 from DIRAC.Core.Base import Script 
 
 Script.setUsageMessage("""
@@ -17,17 +18,19 @@ Usage:
 Script.parseCommandLine()
 
 from DIRAC.Core.Utilities.List                          import sortList
-from DIRAC.DataManagementSystem.Client.ReplicaManager   import ReplicaManager
-import os,sys
+from DIRAC.Resources.Catalog.FileCatalog import FileCatalog
+
+import os, sys
 
 if not len(sys.argv) >= 2:
   Script.showHelp()
-  DIRAC.exit( -1 )
+  DIRACExit( -1 )
 else:
   inputFileName = sys.argv[1]
   catalogs = []
   if len(sys.argv) == 3:
     catalogs = [sys.argv[2]]  
+  
 
 if os.path.exists(inputFileName):
   inputFile = open(inputFileName,'r')
@@ -37,11 +40,10 @@ if os.path.exists(inputFileName):
 else:
   lfns = [inputFileName]
 
-rm = ReplicaManager()
-res = rm.getCatalogFileMetadata(lfns,catalogs=catalogs)
+res = FileCatalog( catalogs = catalogs ).getFileMetadata( lfns )
 if not res['OK']:
   print "ERROR:",res['Message']
-  sys.exit()
+  DIRACExit( -1 )
 
 print '%s %s %s %s %s' % ('FileName'.ljust(100),'Size'.ljust(10),'GUID'.ljust(40),'Status'.ljust(8),'Checksum'.ljust(10))
 for lfn in sortList(res['Value']['Successful'].keys()):

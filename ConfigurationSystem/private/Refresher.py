@@ -2,6 +2,7 @@
 __RCSID__ = "$Id$"
 
 import threading
+import thread
 import time
 import random
 from DIRAC.ConfigurationSystem.Client.ConfigurationData import gConfigurationData
@@ -38,7 +39,7 @@ class Refresher( threading.Thread ):
     self.__callbacks = { 'newVersion' : [] }
     gEventDispatcher.registerEvent( "CSNewVersion" )
     random.seed()
-    self.__triggeredRefreshLock = LockRing.LockRing().getLock( "Refresher.triggerUpdate" )
+    self.__triggeredRefreshLock = LockRing.LockRing().getLock()
 
   def disable( self ):
     self.__refreshEnabled = False
@@ -71,7 +72,10 @@ class Refresher( threading.Thread ):
         return
       self.__lastUpdateTime = time.time()
     finally:
-      self.__triggeredRefreshLock.release()
+      try:
+        self.__triggeredRefreshLock.release()
+      except thread.error:
+        pass
     #Launch the refresh
     thd = threading.Thread( target = self.__refreshInThread )
     thd.setDaemon( 1 )
@@ -152,6 +156,8 @@ class Refresher( threading.Thread ):
       else:
         updatingErrorsList.append( dRetVal[ 'Message' ] )
         gLogger.warn( "Can't update from server", "Error while updating from %s: %s" % ( sServer, dRetVal[ 'Message' ] ) )
+        if dRetVal[ 'Message' ].find( "Insane environment" ) > -1:
+          break
     return S_ERROR( "Reason(s):\n\t%s" % "\n\t".join( List.uniqueElements( updatingErrorsList ) ) )
 
   def daemonize( self ):

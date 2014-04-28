@@ -2,26 +2,22 @@
 
 __RCSID__ = "$Id$"
 
-from DIRAC import gLogger, gConfig, gMonitor, S_OK, S_ERROR, rootPath
+from DIRAC import gLogger, S_OK
 
 from DIRAC.Core.Base.AgentModule                                import AgentModule
-from DIRAC.StorageManagementSystem.Client.StorageManagerClient  import StorageManagerClient
 from DIRAC.Resources.Catalog.FileCatalog                        import FileCatalog
 from DIRAC.DataManagementSystem.Client.DataIntegrityClient      import DataIntegrityClient
-from DIRAC.StorageManagementSystem.DB.StorageManagementDB       import StorageManagementDB
+from DIRAC.DataManagementSystem.Client.DataManager              import DataManager
 
-import time, os, sys, re
-from types import *
-#test 1
 AGENT_NAME = 'StorageManagement/RequestPreparationAgent'
 
 class RequestPreparationAgent( AgentModule ):
 
   def initialize( self ):
     self.fileCatalog = FileCatalog()
-    #self.stagerClient = StorageManagerClient()
+    self.dm = DataManager()
+    self.stagerClient = StorageManagerClient()
     self.dataIntegrityClient = DataIntegrityClient()
-    self.storageDB = StorageManagementDB()
     # This sets the Default Proxy to used as that defined under
     # /Operations/Shifter/DataManager
     # the shifterProxy option in the Configuration can be used to change this default.
@@ -59,7 +55,7 @@ class RequestPreparationAgent( AgentModule ):
       return S_OK()
     terminalReplicaIDs = {}
     for lfn, reason in terminal.items():
-      for se, replicaID in replicas[lfn].items():
+      for _se, replicaID in replicas[lfn].items():
         terminalReplicaIDs[replicaID] = reason
       replicas.pop( lfn )
     gLogger.info( "RequestPreparation.prepareNewReplicas: %s files exist in the FileCatalog." % len( exist ) )
@@ -77,7 +73,7 @@ class RequestPreparationAgent( AgentModule ):
       gLogger.error( 'RequestPreparation.prepareNewReplicas: Failed determine sizes of any files' )
       return S_OK()
     for lfn, reason in terminal.items():
-      for se, replicaID in replicas[lfn].items():
+      for _se, replicaID in replicas[lfn].items():
         terminalReplicaIDs[replicaID] = reason
       replicas.pop( lfn )
     gLogger.info( "RequestPreparation.prepareNewReplicas: Obtained %s file sizes from the FileCatalog." % len( fileSizes ) )
@@ -95,7 +91,7 @@ class RequestPreparationAgent( AgentModule ):
       gLogger.error( 'RequestPreparation.prepareNewReplicas: Failed determine replicas for any files' )
       return S_OK()
     for lfn, reason in terminal.items():
-      for se, replicaID in replicas[lfn].items():
+      for _se, replicaID in replicas[lfn].items():
         terminalReplicaIDs[replicaID] = reason
       replicas.pop( lfn )
     gLogger.info( "RequestPreparation.prepareNewReplicas: Obtained replica information for %s file from the FileCatalog." % len( fileReplicas ) )
@@ -116,14 +112,14 @@ class RequestPreparationAgent( AgentModule ):
     # Update the states of the files in the database
     if terminalReplicaIDs:
       gLogger.info( "RequestPreparation.prepareNewReplicas: %s replicas are terminally failed." % len( terminalReplicaIDs ) )
-      #res = self.stagerClient.updateReplicaFailure( terminalReplicaIDs )
-      res = self.storageDB.updateReplicaFailure( terminalReplicaIDs )
+      # res = self.stagerClient.updateReplicaFailure( terminalReplicaIDs )
+      res = self.stagerClient.updateReplicaFailure( terminalReplicaIDs )
       if not res['OK']:
         gLogger.error( "RequestPreparation.prepareNewReplicas: Failed to update replica failures.", res['Message'] )
     if replicaMetadata:
       gLogger.info( "RequestPreparation.prepareNewReplicas: %s replica metadata to be updated." % len( replicaMetadata ) )
       # Sets the Status='Waiting' of CacheReplicas records that are OK with catalogue checks
-      res = self.storageDB.updateReplicaInformation( replicaMetadata )
+      res = self.stagerClient.updateReplicaInformation( replicaMetadata )
       if not res['OK']:
         gLogger.error( "RequestPreparation.prepareNewReplicas: Failed to update replica metadata.", res['Message'] )
     return S_OK()
@@ -131,7 +127,7 @@ class RequestPreparationAgent( AgentModule ):
   def __getNewReplicas( self ):
     """ This obtains the New replicas from the Replicas table and for each LFN the requested storage element """
     # First obtain the New replicas from the CacheReplicas table
-    res = self.storageDB.getCacheReplicas( {'Status':'New'} )
+    res = self.stagerClient.getCacheReplicas( {'Status':'New'} )
     if not res['OK']:
       gLogger.error( "RequestPreparation.__getNewReplicas: Failed to get replicas with New status.", res['Message'] )
       return res
@@ -173,7 +169,6 @@ class RequestPreparationAgent( AgentModule ):
 
   def __getFileSize( self, lfns ):
     """ This obtains the file size from the FileCatalog. """
-    failed = []
     fileSizes = {}
     zeroSize = {}
     res = self.fileCatalog.getFileSize( lfns )
@@ -196,7 +191,7 @@ class RequestPreparationAgent( AgentModule ):
     """ This obtains the replicas from the FileCatalog. """
     replicas = {}
     noReplicas = {}
-    res = self.fileCatalog.getReplicas( lfns )
+    res = self.dm.getActiveReplicas( lfns )
     if not res['OK']:
       gLogger.error( "RequestPreparation.__getFileReplicas: Failed to obtain file replicas.", res['Message'] )
       return res
@@ -214,12 +209,13 @@ class RequestPreparationAgent( AgentModule ):
 
   def __reportProblematicFiles( self, lfns, reason ):
     return S_OK()
-    res = self.dataIntegrityClient.setFileProblematic( lfns, reason, self.name )
-    if not res['OK']:
-      gLogger.error( "RequestPreparation.__reportProblematicFiles: Failed to report missing files.", res['Message'] )
-      return res
-    if res['Value']['Successful']:
-      gLogger.info( "RequestPreparation.__reportProblematicFiles: Successfully reported %s missing files." % len( res['Value']['Successful'] ) )
-    if res['Value']['Failed']:
-      gLogger.info( "RequestPreparation.__reportProblematicFiles: Failed to report %s problematic files." % len( res['Value']['Failed'] ) )
-    return res
+    #res = self.dataIntegrityClient.setFileProblematic( lfns, reason, sourceComponent = 'RequestPreparationAgent' )
+    #if not res['OK']:
+    #  gLogger.error( "RequestPreparation.__reportProblematicFiles: Failed to report missing files.", res['Message'] )
+    #  return res
+    #if res['Value']['Successful']:
+    #  gLogger.info( "RequestPreparation.__reportProblematicFiles: Successfully reported %s missing files." % len( res['Value']['Successful'] ) )
+    #if res['Value']['Failed']:
+    #  gLogger.info( "RequestPreparation.__reportProblematicFiles: Failed to report %s problematic files." % len( res['Value']['Failed'] ) )
+    #return res
+

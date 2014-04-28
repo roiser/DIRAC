@@ -1,301 +1,474 @@
-################################################################################
-# $HeadURL $
-################################################################################
-"""
-  This module contains a class to synchronize the content of the DataBase with what is the CS
-"""
+# $HeadURL:  $
+''' Synchronizer
 
-from DIRAC                                                      import gLogger, S_OK
-from DIRAC.Core.Utilities.SiteCEMapping                         import getSiteCEMapping
-from DIRAC.Core.Utilities.SitesDIRACGOCDBmapping                import getGOCSiteName, getDIRACSiteName
+  Module that updates the RSS database ( ResourceStatusDB ) with the information
+  in the Resources section. If there are additions in the CS, those are incorporated
+  to the DB. If there are deletions, entries in RSS tables for those elements are
+  deleted ( except the Logs table ).
 
-from DIRAC.ResourceStatusSystem.Utilities                       import CS, Utils
-from DIRAC.Core.LCG.GOCDBClient                                 import GOCDBClient
+'''
 
-from DIRAC.ResourceStatusSystem.Client.ResourceStatusClient     import ResourceStatusClient
-from DIRAC.ResourceStatusSystem.Client.ResourceManagementClient import ResourceManagementClient
+__RCSID__ = '$Id:  $'
 
-class Synchronizer(object):
+from DIRAC                                                 import gConfig, gLogger, S_OK
+from DIRAC.ConfigurationSystem.Client.Helpers.Operations   import Operations
+from DIRAC.ConfigurationSystem.Client.Helpers.Resources    import Resources, RESOURCE_NODE_MAPPING
+from DIRAC.Interfaces.API.DiracAdmin                       import DiracAdmin
+from DIRAC.ResourceStatusSystem.Client                     import ResourceStatusClient
+from DIRAC.ResourceStatusSystem.Utilities.RssConfiguration import RssConfiguration
 
-  def __init__( self, rsClient = None, rmClient = None ):
-
-    self.GOCDBClient = GOCDBClient()
-    self.rsClient = ResourceStatusClient()     if rsClient == None else rsClient
-    self.rmClient = ResourceManagementClient() if rmClient == None else rmClient
-
-    self.synclist = [ 'Sites', 'Resources', 'StorageElements', 'Services', 'RegistryUsers' ]
-
-################################################################################
-
-  def sync( self, _a, _b ):
+class Synchronizer( object ):
+  '''
+  Every time there is a successful write on the CS, Synchronizer().sync() is 
+  executed. It updates the database with the values on the CS.
+  '''
+  
+  def __init__( self ):
     """
-    :params:
-      :attr:`thingsToSync`: list of things to sync
+    Constructor.
+    
+    examples:
+      >>> s = Synchronizer()
     """
-    gLogger.info( "!!! Sync DB content with CS content for %s !!!" % ( ", ".join(self.synclist) ) )
-
-    for thing in self.synclist:
-      getattr( self, '_sync' + thing )()
-
+    
+    self.log        = gLogger.getSubLogger( self.__class__.__name__ )
+    self.operations = Operations()
+    self.resources  = Resources()
+    
+    self.rStatus    = ResourceStatusClient.ResourceStatusClient()  
+    self.rssConfig  = RssConfiguration()
+  
+    self.diracAdmin = DiracAdmin()
+  
+  def sync( self, _eventName, _params ):
+    '''
+    Main synchronizer method. It synchronizes the three types of elements: Sites,
+    Resources and Nodes. Each _syncX method returns a dictionary with the additions
+    and deletions.
+    
+    examples:
+      >>> s.sync( None, None )
+          S_OK()
+    
+    :Parameters:
+      **_eventName** - any
+        this parameter is ignored, but needed by caller function.
+      **_params** - any
+        this parameter is ignored, but needed by caller function.
+    
+    :return: S_OK
+    '''
+    
+    defSyncResult = { 'added' : [], 'deleted' : [] }
+    
+    # Sites
+    syncSites = self._syncSites()
+    if not syncSites[ 'OK' ]:
+      self.log.error( syncSites[ 'Message' ] )
+    syncSites = ( syncSites[ 'OK' ] and syncSites[ 'Value' ] ) or defSyncResult
+    
+    # Resources
+    syncResources = self._syncResources()
+    if not syncResources[ 'OK' ]:
+      self.log.error( syncResources[ 'Message' ] )
+    syncResources = ( syncResources[ 'OK' ] and syncResources[ 'Value' ] ) or defSyncResult 
+    
+    # Nodes
+    syncNodes = self._syncNodes()
+    if not syncNodes[ 'OK' ]:
+      self.log.error( syncNodes[ 'Message' ] )
+    syncNodes = ( syncNodes[ 'OK' ] and syncNodes[ 'Value' ] ) or defSyncResult
+      
+    # Notify via email to :  
+    self.notify( syncSites, syncResources, syncNodes )
+    
     return S_OK()
 
-################################################################################
-  def __purge_resource(self, resourceName):
-    # Maybe remove attached SEs
-    SEs = Utils.unpack(self.rsClient.getStorageElement(resourceName=resourceName))
-    Utils.unpack(self.rsClient.removeElement("StorageElement", [s[0] for s in SEs]))
-    # Remove resource itself.
-    Utils.unpack(self.rsClient.removeElement("Resource", resourceName))
+  def notify( self, syncSites, syncResources, syncNodes ):
+    """
+    Method sending email notification with the result of the synchronization. Email
+    is sent to Operations( EMail/Production ) email address.
+    
+    examples:
+      >>> s.notify( {}, {}, {} )
+      >>> s.notify( { 'Site' : { 'added' : [], 'deleted' : [ 'RubbishSite' ] }, {}, {} )
+      >>> s.notify( { 'Site' : { 'added' : [], 'deleted' : [ 'RubbishSite' ] }, 
+                    { 'Computing : { 'added' : [ 'newCE01', 'newCE02' ], 'deleted' : [] }}, {} )
+    
+    :Parameters:
+      **syncSites** - dict() ( keys: added, deleted )
+        dictionary with the sites added and deleted from the DB
+      **syncResources** - dict() ( keys: added, deleted )
+        dictionary with the resources added and deleted from the DB
+      **syncNodes** - dict() ( keys: added, deleted )
+        dictionary with the nodes added and deleted from the DB
+      
+    :return: S_OK
+    """
+    
+    # Human readable summary
+    msgBody = self.getBody( syncSites, syncResources, syncNodes ) 
+    self.log.info( msgBody )
+    
+    # Email addresses
+    toAddress   = self.operations.getValue( 'EMail/Production', '' )
+    fromAddress = self.rssConfig.getConfigFromAddress( '' )
+    
+    if toAddress and fromAddress and msgBody:
+      
+      # Subject of the email
+      setup   = gConfig.getValue( 'DIRAC/Setup' )
+      subject = '[RSS](%s) CS Synchronization' % setup
+      
+      self.diracAdmin.sendMail( toAddress, subject, msgBody, fromAddress = fromAddress )
+     
+  def getBody( self, syncSites, syncResources, syncNodes ):
+    """
+    Method that given the outputs of the three synchronization methods builds a
+    human readable string.
+    
+    examples:
+      >>> s.getBody( {}, {}, {} )
+          ''
+      >>> s.getBody( { 'Site' : { 'added' : [], 'deleted' : [ 'RubbishSite' ] }, {}, {} )
+          '''
+          SITES:
+          Site:
+            deleted:1
+              RubbishSite
+          '''
+      >>> s.getBody( { 'Site' : { 'added' : [], 'deleted' : [ 'RubbishSite' ] }, 
+                     { 'Computing : { 'added' : [ 'newCE01', 'newCE02' ], 'deleted' : [] }}, {} )    
+          '''
+          SITES:
+          Site:
+            deleted:1
+              RubbishSite
+          RESOURCES:
+          Computing:
+            added:2
+              newCE01
+              newCE02    
+          '''
+          
+    :Parameters:
+      **syncSites** - dict() ( keys: added, deleted )
+        dictionary with the sites added and deleted from the DB
+      **syncResources** - dict() ( keys: added, deleted )
+        dictionary with the resources added and deleted from the DB
+      **syncNodes** - dict() ( keys: added, deleted )
+        dictionary with the nodes added and deleted from the DB
+      
+    :return: str    
+    """
+        
+    syncMsg = ''
+       
+    for element, syncResult in [ ( 'SITES', syncSites ), ( 'RESOURCES', syncResources ), 
+                                 ( 'NODES', syncNodes ) ]:
+    
+      elementsMsg = ''
+    
+      for elementType, elements in syncResult.items():
+    
+        elementMsg = ''
+        if elements[ 'added' ]:
+          elementMsg += '\n  %s added: %d \n' % ( elementType, len( elements[ 'added' ] ) )
+          elementMsg += '    ' + '\n    '.join( elements[ 'added' ] ) 
+        if elements[ 'deleted' ]:
+          elementMsg += '\n  %s deleted: %d \n' % ( elementType, len( elements[ 'deleted' ] ) )
+          elementMsg += '    ' + '\n    '.join( elements[ 'deleted' ] )    
+          
+        if elementMsg:
+          elementsMsg += '\n\n%s:\n' % elementType
+          elementsMsg += elementMsg
+        
+      if elementsMsg:
+        syncMsg += '\n\n%s:' % element + elementsMsg
 
-  def __purge_site(self, siteName):
-    # Remove associated resources and services
-    resources = Utils.unpack(self.rsClient.getResource(siteName=siteName))
-    services  = Utils.unpack(self.rsClient.getService(siteName=siteName))
-    _ = [self.__purge_resource(r[0]) for r in resources]
-    Utils.unpack(self.rsClient.removeElement("Service", [s[0] for s in services]))
-    # Remove site itself
-    Utils.unpack(self.rsClient.removeElement("Site", siteName))
+    return syncMsg 
+
+  #.............................................................................
+  # Sync methods: Site, Resource & Node
 
   def _syncSites( self ):
     """
-    Sync DB content with sites that are in the CS
+    Method that synchronizes sites ( using their canonical name: CERN.ch ) with
+    elementType = 'Site'. It gets from the CS the eligible site names and then
+    synchronizes them with the DB. If not on the DB, they are added. If in the DB
+    but not on the CS, they are deleted.
+    
+    examples:
+      >> s._syncSites()
+         S_OK( { 'Site' : { 'added' : [], 'deleted' : [ 'RubbishSite' ] } } )
+    
+    :return: S_OK( { 'Site' : { 'added' : [], 'deleted' : [] }} ) | S_ERROR
     """
-    def getGOCTier(sitesList):
-      return "T" + str(min([int(v) for v in CS.getSiteTiers(sitesList)]))
-
-    # sites in the DB now
-    sitesDB = set((s[0] for s in Utils.unpack(self.rsClient.getSite())))
-
-    # sites in CS now
-    sitesCS = set(CS.getSites())
-
-    gLogger.info("Syncing Sites from CS: %d sites in CS, %d sites in DB" % (len(sitesCS), len(sitesDB)))
-
-    # remove sites and associated resources, services, and storage
-    # elements from the DB that are not in the CS:
-    for s in sitesDB - sitesCS:
-      gLogger.info("Purging Site %s (not in CS anymore)" % s)
-      self.__purge_site(s)
-
-    # add to DB what is missing
-    gLogger.info("Updating %d Sites in DB" % len(sitesCS - sitesDB))
-    for site in sitesCS - sitesDB:
-      siteType = site.split(".")[0]
-      # DIRAC Tier
-      tier = "T" + str(CS.getSiteTier( site ))
-      if siteType == "LCG":
-        # Grid Name of the site
-        gridSiteName = Utils.unpack(getGOCSiteName(site))
-
-        # Grid Tier (with a workaround!)
-        DIRACSitesOfGridSites = Utils.unpack(getDIRACSiteName(gridSiteName))
-        if len( DIRACSitesOfGridSites ) == 1:
-          gt = tier
-        else:
-          gt = getGOCTier( DIRACSitesOfGridSites )
-
-        Utils.protect2(self.rsClient.addOrModifyGridSite, gridSiteName, gt)
-        Utils.protect2(self.rsClient.addOrModifySite, site, tier, gridSiteName )
-
-      elif siteType == "DIRAC":
-        Utils.protect2(self.rsClient.addOrModifySite, site, tier, "NULL" )
-
-################################################################################
-# _syncResources HELPER functions
-
-  def __updateService(self, site, type_):
-    service = type_ + '@' + site
-    Utils.protect2(self.rsClient.addOrModifyService, service, type_, site )
-
-  def __getServiceEndpointInfo(self, node):
-    #res = Utils.unpack( self.GOCDBClient.getServiceEndpointInfo( 'hostname', node ) )
-    res = self.GOCDBClient.getServiceEndpointInfo( 'hostname', node )
-    if res['OK']:
-      res = res[ 'Value' ]
+    
+    # Get site names from the CS
+    foundSites = self.resources.getEligibleSites()
+    if not foundSites[ 'OK' ]:
+      return foundSites
+       
+    sites = {}
+    
+    # Synchronize with the DB
+    resSync = self.__dbSync( 'Site', 'Site', foundSites[ 'Value' ] )
+    if not resSync[ 'OK' ]:
+      self.log.error( 'Error synchronizing Sites' )
+      self.log.error( resSync[ 'Message' ] )
     else:
-      gLogger.warn( 'Error getting hostname info for %s' % node )
-      return []
-        
-    if res == []:
-      #res = Utils.unpack( self.GOCDBClient.getServiceEndpointInfo('hostname', Utils.canonicalURL(node)) )
-      url = Utils.canonicalURL(node)
-      res = self.GOCDBClient.getServiceEndpointInfo('hostname', url )
-      if res['OK']:
-        res = res[ 'Value' ]
-      else:
-        gLogger.warn( 'Error getting canonical hostname info for %s' % node )
-        res = []
-      
-    return res
-
-  def __syncNode(self, NodeInCS, resourcesInDB, resourceType, serviceType, site = "NULL"):
-
-    nodesToUpdate = NodeInCS - resourcesInDB
-    if len(nodesToUpdate) > 0:
-      gLogger.debug(str(NodeInCS))
-      gLogger.debug(str(nodesToUpdate))
-
-    # Update Service table
-    siteInGOCDB = [self.__getServiceEndpointInfo(node) for node in nodesToUpdate]
-    siteInGOCDB = Utils.list_sanitize(siteInGOCDB)
-    sites = [Utils.unpack(getDIRACSiteName(s[0]['SITENAME'])) for s in siteInGOCDB]
-    sites = Utils.list_sanitize(Utils.list_flatten(sites))
-    _ = [self.__updateService(s, serviceType) for s in sites]
-
-    # Update Resource table
-    for node in NodeInCS:
-      if serviceType == "Computing":
-        resourceType = CS.getCEType(site, node)
-      if node not in resourcesInDB and node is not None:
-        try:
-          siteInGOCDB = self.__getServiceEndpointInfo(node)[0]['SITENAME']
-        except IndexError: # No INFO in GOCDB: Node does not exist
-          gLogger.warn("Node %s is not in GOCDB!! Considering that it does not exists!" % node)
-          continue
-
-        assert(type(siteInGOCDB) == str)
-        Utils.protect2(self.rsClient.addOrModifyResource, node, resourceType, serviceType, site, siteInGOCDB )
-        resourcesInDB.add( node )
-
-################################################################################
-
+      sites = resSync[ 'Value' ]  
+  
+    return S_OK( { 'Site' : sites } )
+    
   def _syncResources( self ):
-    gLogger.info("Starting sync of Resources")
-
-    # resources in the DB now
-    resourcesInDB = set((r[0] for r in Utils.unpack(self.rsClient.getResource())))
-
-    # Site-CE / Site-SE mapping in CS now
-    CEinCS = Utils.unpack(getSiteCEMapping( 'LCG' ))
-
-    # All CEs in CS now
-    CEInCS = Utils.set_sanitize([CE for celist in CEinCS.values() for CE in celist])
-
-    # All SE Nodes in CS now
-    SENodeInCS = set(CS.getSENodes())
-
-    # LFC Nodes in CS now
-    LFCNodeInCS_L = set(CS.getLFCNode(readable = "ReadOnly"))
-    LFCNodeInCS_C = set(CS.getLFCNode(readable = "ReadWrite"))
-
-    # FTS Nodes in CS now
-    FTSNodeInCS = set([v.split("/")[2][0:-5] for v
-                       in CS.getTypedDictRootedAt(root="/Resources/FTSEndpoints").values()])
-
-    # VOMS Nodes in CS now
-    VOMSNodeInCS = set(CS.getVOMSEndpoints())
-
-    # complete list of resources in CS now
-    resourcesInCS = CEInCS | SENodeInCS | LFCNodeInCS_L | LFCNodeInCS_C | FTSNodeInCS | VOMSNodeInCS
-
-    gLogger.info("  %d resources in CS, %s resources in DB, updating %d resources" %
-                 (len(resourcesInCS), len(resourcesInDB), len(resourcesInCS)-len(resourcesInDB)))
-
-    # Remove resources that are not in the CS anymore
-    for res in resourcesInDB - resourcesInCS:
-      gLogger.info("Purging resource %s. Reason: not in CS anywore." % res)
-      self.__purge_resource(res)
-
-    # Add to DB what is in CS now and wasn't before
-
-    # CEs
-    for site in CEinCS:
-      self.__syncNode(set(CEinCS[site]), resourcesInDB, "", "Computing", site)
-
-    # SRMs
-    self.__syncNode(SENodeInCS, resourcesInDB, "SE", "Storage")
-
-    # LFC_C
-    self.__syncNode(LFCNodeInCS_C, resourcesInDB, "LFC_C", "Storage")
-
-    # LFC_L
-    self.__syncNode(LFCNodeInCS_L, resourcesInDB, "LFC_L", "Storage")
-
-    # FTSs
-    self.__syncNode(FTSNodeInCS, resourcesInDB, "FTS", "Storage")
-
-    # VOMSs
-    self.__syncNode(VOMSNodeInCS, resourcesInDB, "VOMS", "VOMS")
-
-################################################################################
-
-  def _syncStorageElements( self ):
-
-    # Get StorageElements from the CS and the DB
-    CSSEs = set(CS.getSEs())
-    DBSEs = set((s[0] for s in Utils.unpack(self.rsClient.getStorageElement())))
-
-    # Remove storageElements that are in DB but not in CS
-    for se in DBSEs - CSSEs:
-      Utils.protect2(self.rsClient.removeElement, 'StorageElement', se )
-
-    # Add new storage elements
-    gLogger.info("Updating %d StorageElements in DB (%d on CS vs %d on DB)" % (len(CSSEs - DBSEs), len(CSSEs), len(DBSEs)))
-    for SE in CSSEs - DBSEs:
-      srm = CS.getSEHost( SE )
-      if not srm:
-        gLogger.warn("%s has no srm URL in CS!!!" % SE)
+    """
+    Method that synchronizes resources as defined on RESOURCE_NODE_MAPPING dictionary
+    keys. It makes one sync round per key ( elementType ). Gets from the CS the 
+    eligible Resource/<elementType> names and then synchronizes them with the DB. 
+    If not on the DB, they are added. If in the DB but not on the CS, they are deleted.
+    
+    examples:
+      >>> s._syncResources() 
+          S_OK( { 'Computing' : { 'added' : [ 'newCE01', 'newCE02' ], 'deleted' : [] },
+                  'Storage'   : { 'added' : [], 'deleted' : [] },
+                  ... } ) 
+    
+    :return: S_OK( { 'RESOURCE_NODE_MAPPINGKey1' : { 'added' : [], 'deleted' : [] }, ...} )
+    """
+    
+    resources = {}
+    
+    # Iterate over the different elementTypes for Resource ( Computing, Storage... )
+    for elementType in RESOURCE_NODE_MAPPING.keys():
+      
+      # Get Resource / <elementType> names from CS
+      foundResources = self.resources.getEligibleResources( elementType )
+      if not foundResources[ 'OK' ]:
+        self.log.error( foundResources[ 'Message' ] )
         continue
-      #siteInGOCDB = Utils.unpack(self.GOCDBClient.getServiceEndpointInfo( 'hostname', srm ))
-      siteInGOCDB = self.GOCDBClient.getServiceEndpointInfo( 'hostname', srm )
-      if siteInGOCDB[ 'OK' ]:
-        siteInGOCDB = siteInGOCDB[ 'Value' ]
+      
+      # Translate CS result into a list
+      foundResources = foundResources[ 'Value' ]
+      
+      # Synchronize with the DB
+      resSync = self.__dbSync( 'Resource', elementType, foundResources )
+      if not resSync[ 'OK' ]:
+        self.log.error( 'Error synchronizing %s %s' % ( 'Resource', elementType ) )
+        self.log.error( resSync[ 'Message' ] )
+      else: 
+        resources[ elementType ] = resSync[ 'Value' ] 
+  
+    return S_OK( resources )
+
+  def _syncNodes( self ):
+    """
+    Method that synchronizes resources as defined on RESOURCE_NODE_MAPPING dictionary
+    values. It makes one sync round per key ( elementType ). Gets from the CS the 
+    eligible Node/<elementType> names and then synchronizes them with the DB. 
+    If not on the DB, they are added. If in the DB but not on the CS, they are deleted.
+    
+    examples:
+      >>> s._syncNodes() 
+          S_OK( { 'Queue' : { 'added' : [], 'deleted' : [] },
+                  ... } ) 
+    
+    :return: S_OK( { 'RESOURCE_NODE_MAPPINGValue1' : { 'added' : [], 'deleted' : [] }, ...} )
+    """
+    
+    nodes = {}
+    
+    # Iterate over the different elementTypes for Node ( Queue, AccessProtocol... )
+    for elementType in RESOURCE_NODE_MAPPING.values():
+      
+      # Get Node / <elementType> names from CS
+      foundNodes = self.resources.getEligibleNodes( elementType )
+      if not foundNodes[ 'OK' ]:
+        self.log.error( foundNodes[ 'Value' ] )
+        continue
+      
+      # Translate CS result into a list : maps NodeName to SiteName<>NodeName to 
+      # avoid duplicates
+      # Looong list comprehension, sorry !
+      foundNodes = [ '%s<>%s' % ( key, item ) for key, subDict in foundNodes[ 'Value' ].items() 
+                     for subList in subDict.values() for item in subList ]
+             
+      # Synchronize with the DB       
+      resSync = self.__dbSync( 'Node', elementType, foundNodes )
+      if not resSync[ 'OK' ]:
+        self.log.error( 'Error synchronizing %s %s' % ( 'Node', elementType ) )
+        self.log.error( resSync[ 'Message' ] )
+      else: 
+        nodes[ elementType ] = resSync[ 'Value' ] 
+  
+    return S_OK( nodes )
+
+  #.............................................................................
+  # DB sync actions
+  
+  def __dbSync( self, elementFamily, elementType, elementsCS ):
+    """
+    Method synchronizing CS and DB. Compares <elementsCS> with <elementsDB>
+    given the elementFamily and elementType ( e.g. Resource / Computing ).
+    If there are missing elements in the DB, are inserted. If are missing elements
+    in the CS, are deleted from the DB. Note that the logs from the RSS DB
+    are kept ! ( just in case ).
+    
+    :Parameters:
+      **elementFamily** - str
+        any of the valid element families : Site, Resource, Node
+      **elementType** - str
+        any of the valid element types for <elementFamily>
+      **elementsCS** - list
+        list with the elements for <elementFamily>/<elementType> found in the CS  
+    
+    :return: S_OK( { 'added' : [], 'deleted' : [] } ) | S_ERROR
+    """ 
+    
+    # deleted, added default response
+    syncRes = { 
+                'deleted' : [],
+                'added'   : [],
+              }
+    
+    # Gets <elementFamily>/<elementType> elements from DB
+    elementsDB = self.rStatus.selectStatusElement( elementFamily, 'Status', 
+                                                   elementType = elementType,
+                                                   meta = { 'columns' : [ 'name' ] } )
+    if not elementsDB[ 'OK' ]:
+      return elementsDB
+    elementsDB = [ elementDB[ 0 ] for elementDB in elementsDB[ 'Value' ] ]      
+    
+    # Elements in DB but not in CS -> to be deleted
+    toBeDeleted = list( set( elementsDB ).difference( set( elementsCS ) ) )
+    if toBeDeleted:
+      resDelete = self.__dbDelete( elementFamily, elementType, toBeDeleted )
+      if not resDelete[ 'OK' ]:
+        return resDelete  
       else:
-        gLogger.error("Error getting hostname for %s from GOCDB!!!" % srm)
-        continue
-      if siteInGOCDB == []:
-        gLogger.warn("%s is not in GOCDB!!!" % srm)
-        continue
-      siteInGOCDB = siteInGOCDB[ 0 ][ 'SITENAME' ]
-      Utils.protect2(self.rsClient.addOrModifyStorageElement, SE, srm, siteInGOCDB )
+        syncRes[ 'deleted' ] = toBeDeleted
+    
+    # Elements in CS but not in DB -> to be added
+    toBeAdded = list( set( elementsCS ).difference( set( elementsDB ) ) )
+    if toBeAdded:
+      resInsert = self.__dbInsert( elementFamily, elementType, toBeAdded )
+      if not resInsert[ 'OK' ]:
+        return resInsert
+      else:
+        syncRes[ 'added' ] = toBeAdded
+           
+    return S_OK( syncRes )
+  
+  def __dbDelete( self, elementFamily, elementType, toBeDeleted ):
+    """
+    Method that given the elementFamily and elementType, deletes all entries
+    in the History and Status tables for the given elements in toBeDeleted ( all
+    their status Types ).
 
+    :Parameters:
+      **elementFamily** - str
+        any of the valid element families : Site, Resource, Node
+      **elementType** - str
+        any of the valid element types for <elementFamily>, just used for logging
+        purposes.
+      **toBeDeleted** - list
+        list with the elements to be deleted  
+    
+    :return: S_OK | S_ERROR    
+    """
+    
+    self.log.info( 'Deleting %s %s:' % ( elementFamily, elementType ) )
+    self.log.info( toBeDeleted )
+    
+    return self.rStatus._extermineStatusElement( elementFamily, toBeDeleted )
+  
+  def __dbInsert( self, elementFamily, elementType, toBeAdded ):  
+    """
+    Method that given the elementFamily and elementType, adds all elements in
+    toBeAdded with their respective statusTypes, obtained from the CS. They 
+    are synchronized with status 'Unknown' and reason 'Synchronized'.
+
+    :Parameters:
+      **elementFamily** - str
+        any of the valid element families : Site, Resource, Node
+      **elementType** - str
+        any of the valid element types for <elementFamily>
+      **toBeDeleted** - list
+        list with the elements to be added  
+    
+    :return: S_OK | S_ERROR    
+    """
+    
+    self.log.info( 'Adding %s %s:' % ( elementFamily, elementType ) )
+    self.log.info( toBeAdded )
+    
+    statusTypes = self.rssConfig.getConfigStatusType( elementType )
+
+    for element in toBeAdded:
+      
+      for statusType in statusTypes:
+  
+        resInsert = self.rStatus.addIfNotThereStatusElement( elementFamily, 'Status', 
+                                                             name        = element, 
+                                                             statusType  = statusType, 
+                                                             status      = 'Unknown', 
+                                                             elementType = elementType, 
+                                                             reason      = 'Synchronized')
+
+        if not resInsert[ 'OK' ]:
+          return resInsert
+    
+    return S_OK()
+    
+#...............................................................................    
+ 
+#  
+#  def _syncUsers( self ):
+#    '''
+#      Sync Users: compares CS with DB and does the necessary modifications.
+#    '''    
+#    
+#    gLogger.verbose( '-- Synchronizing users --')
+#    
+#    usersCS = CSHelpers.getRegistryUsers()
+#    if not usersCS[ 'OK' ]:
+#      return usersCS
+#    usersCS = usersCS[ 'Value' ]
+#    
+#    gLogger.verbose( '%s users found in CS' % len( usersCS ) )
+#    
+#    usersDB = self.rManagement.selectUserRegistryCache( meta = { 'columns' : [ 'login' ] } ) 
+#    if not usersDB[ 'OK' ]:
+#      return usersDB    
+#    usersDB = [ userDB[0] for userDB in usersDB[ 'Value' ] ]
+#    
+#    # Users that are in DB but not in CS
+#    toBeDeleted = list( set( usersDB ).difference( set( usersCS.keys() ) ) )
+#    gLogger.verbose( '%s users to be deleted' % len( toBeDeleted ) )
+#    
+#    # Delete users
+#    # FIXME: probably it is not needed since there is a DatabaseCleanerAgent
+#    for userLogin in toBeDeleted:
+#      
+#      deleteQuery = self.rManagement.deleteUserRegistryCache( login = userLogin )
+#      
+#      gLogger.verbose( '... %s' % userLogin )
+#      if not deleteQuery[ 'OK' ]:
+#        return deleteQuery      
+#     
+#    # AddOrModify Users 
+#    for userLogin, userDict in usersCS.items():
+#      
+#      _name  = userDict[ 'DN' ].split( '=' )[ -1 ]
+#      _email = userDict[ 'Email' ]
+#      
+#      query = self.rManagement.addOrModifyUserRegistryCache( userLogin, _name, _email )
+#      gLogger.verbose( '-> %s' % userLogin )
+#      if not query[ 'OK' ]:
+#        return query     
+#  
+#    return S_OK()
+    
 ################################################################################
-
-  def _syncServices(self):
-    """This function is in charge of cleaning the Service table in DB
-    in case of obsolescence."""
-    # services in the DB now
-    servicesInDB = Utils.unpack(self.rsClient.getService())
-    for service_name, service_type, site_name in servicesInDB:
-      if not service_type in ["VO-BOX", "CondDB", "VOMS", "Storage"]:
-        if Utils.unpack(self.rsClient.getResource(siteName=site_name, serviceType=service_type)) == []:
-          gLogger.info("Deleting Service %s since it has no corresponding resources." % service_name)
-          Utils.protect2(self.rsClient.removeElement, "Service", service_name)
-      elif service_type == "Storage":
-        res = self.rsClient.getSite( siteName = site_name, meta = { 'columns' : 'GridSiteName'} )
-        if res[ 'OK' ]:
-          res = res[ 'Value' ]
-        else:
-          res = []
-        
-        if res:
-          if self.rsClient.getResource( gridSiteName = res[0], serviceType = service_type ) == []:
-            gLogger.info("Deleting Service %s since it has no corresponding resources." % service_name)
-            Utils.protect2(self.rsClient.removeElement, "Service", service_name)
-
-  def _syncRegistryUsers(self):
-    users = CS.getTypedDictRootedAt("Users", root= "/Registry")
-    usersInCS = set(users.keys())
-    usersInDB = set((u[0] for u in Utils.unpack(self.rmClient.getUserRegistryCache())))
-    usersToAdd = usersInCS - usersInDB
-    usersToDel = usersInDB - usersInCS
-
-    gLogger.info("Updating Registry Users: + %d, - %d" % (len(usersToAdd), len(usersToDel)))
-    if len(usersToAdd) > 0:
-      gLogger.debug(str(usersToAdd))
-    if len(usersToDel) > 0:
-      gLogger.debug(str(usersToDel))
-
-    for u in usersToAdd:
-      if type(users[u]['DN']) == list:
-        users[u]['DN'] = users[u]['DN'][0]
-      if type(users[u]['Email']) == list:
-        users[u]['Email'] = users[u]['Email'][0]
-      users[u]['DN'] = users[u]['DN'].split('=')[-1]
-      Utils.unpack(self.rmClient.addOrModifyUserRegistryCache( u, users[u]['DN'], users[u]['Email'].lower()))
-
-    for u in usersToDel:
-      Utils.protect2(self.rmClient.deleteUserRegistryCache, u)
-
-################################################################################
-#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF
+#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF  

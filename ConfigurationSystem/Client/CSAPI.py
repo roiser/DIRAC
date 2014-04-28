@@ -18,14 +18,17 @@ class CSAPI:
     """
     self.__csModified = False
     self.__baseSecurity = "/Registry"
+    self.__baseResources = '/Resources_new'
 
     self.__userDN = ''
     self.__userGroup = ''
     self.__rpcClient = None
     self.__csMod = None
 
-    self.__initialized = False
-    self.__initialized = self.initialize()
+    self.__initialized = S_ERROR( "Not initialized" )
+    self.initialize()
+    if not self.__initialized[ 'OK' ]:
+      gLogger.error( self.__initialized )
 
   def __getProxyID( self ):
     proxyLocation = Locations.getProxyLocation()
@@ -42,7 +45,7 @@ class CSAPI:
       return False
     idCert = retVal[ 'Value' ]
     self.__userDN = idCert.getSubjectDN()[ 'Value' ]
-    self.__userGroup = idCert.getDIRACGroup()[ 'Value' ]
+    self.__userGroup = chain.getDIRACGroup()[ 'Value' ]
     return True
 
   def __getCertificateID( self ):
@@ -61,36 +64,41 @@ class CSAPI:
     return True
 
   def initialize( self ):
-    if self.__initialized:
-      return True
+    if self.__initialized[ 'OK' ]:
+      return self.__initialized
     if not gConfig.useServerCertificate():
       res = self.__getProxyID()
     else:
       res = self.__getCertificateID()
     if not res:
-      return False
+      self.__initialized = S_ERROR( "Cannot locate client credentials" )
+      return self.__initialized
     retVal = gConfig.getOption( "/DIRAC/Configuration/MasterServer" )
     if not retVal[ 'OK' ]:
-      gLogger.warn( "Master server is not known. Is everything initialized?" )
-      return False
+      self.__initialized = S_ERROR( "Master server is not known. Is everything initialized?" )
+      return self.__initialized
     self.__rpcClient = RPCClient( gConfig.getValue( "/DIRAC/Configuration/MasterServer", "" ) )
     self.__csMod = Modificator( self.__rpcClient, "%s - %s" % ( self.__userGroup, self.__userDN ) )
     retVal = self.downloadCSData()
     if not retVal[ 'OK' ]:
-      gLogger.error( "Can not download the remote cfg. Is everything initialized?" )
-      return False
-    return True
+      self.__initialized = S_ERROR( "Can not download the remote cfg. Is everything initialized?" )
+      return self.__initialized
+    self.__initialized = S_OK()
+    return self.__initialized
 
   def downloadCSData( self ):
+    if not self.__csMod:
+      return S_ERROR( "CSAPI not yet initialized" )
     result = self.__csMod.loadFromRemote()
     if not result[ 'OK' ]:
       return result
+    self.__csModified = False
     self.__csMod.updateGConfigurationData()
     return S_OK()
 
   def listUsers( self , group = False ):
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     if not group:
       return S_OK( self.__csMod.getSections( "%s/Users" % self.__baseSecurity ) )
     else:
@@ -101,18 +109,18 @@ class CSAPI:
         return S_OK( List.fromChar( users ) )
 
   def listHosts( self ):
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     return S_OK( self.__csMod.getSections( "%s/Hosts" % self.__baseSecurity ) )
 
   def describeUsers( self, users = False ):
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     return S_OK( self.__describeEntity( users ) )
 
   def describeHosts( self, hosts = False ):
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     return S_OK( self.__describeEntity( hosts, True ) )
 
   def __describeEntity( self, mask, hosts = False ):
@@ -142,16 +150,16 @@ class CSAPI:
     """
     List all groups
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     return S_OK( self.__csMod.getSections( "%s/Groups" % self.__baseSecurity ) )
 
   def describeGroups( self, mask = False ):
     """
     List all groups that are in the mask (or all if no mask) with their properties
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     groups = [ group for group in self.__csMod.getSections( "%s/Groups" % self.__baseSecurity ) if not mask or ( mask and group in mask ) ]
     groupsDict = {}
     for group in groups:
@@ -166,8 +174,8 @@ class CSAPI:
     """
     Delete a user/s can receive as a param either a string or a list
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     if type( users ) == types.StringType:
       users = [ users ]
     usersData = self.describeUsers( users )['Value']
@@ -218,8 +226,8 @@ class CSAPI:
         - <extra params>
     Returns True/False
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     for prop in ( "DN", "Groups" ):
       if prop not in properties:
         gLogger.error( "Missing %s property for user %s" % ( prop, username ) )
@@ -254,8 +262,8 @@ class CSAPI:
         - <extra params>
     Returns True/False
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     modifiedUser = False
     userData = self.describeUsers( [ username ] )['Value']
     if username not in userData:
@@ -311,8 +319,8 @@ class CSAPI:
         - <extra params>
     Returns True/False
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     if groupname in self.listGroups()['Value']:
       gLogger.error( "Group %s is already registered" % groupname )
       return S_OK( False )
@@ -333,8 +341,8 @@ class CSAPI:
         - <extra params>
     Returns True/False
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     modifiedGroup = False
     groupData = self.describeGroups( [ groupname ] )['Value']
     if groupname not in groupData:
@@ -366,8 +374,8 @@ class CSAPI:
         - <extra params>
     Returns True/False
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     for prop in ( "DN", ):
       if prop not in properties:
         gLogger.error( "Missing %s property for host %s" % ( prop, hostname ) )
@@ -392,8 +400,8 @@ class CSAPI:
         - <extra params>
     Returns True/False
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     modifiedHost = False
     hostData = self.describeHosts( [ hostname ] )['Value']
     if hostname not in hostData:
@@ -420,8 +428,8 @@ class CSAPI:
     Sync users with the cfg contents. Usernames have to be sections containing
     DN, Groups, and extra properties as parameters
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     done = True
     for user in usersCFG.listSections():
       properties = {}
@@ -461,9 +469,76 @@ class CSAPI:
         self.__csMod.setOptionValue( "%s/Groups/%s/Users" % ( self.__baseSecurity, group ),
                                      ",".join( filteredUsers ) )
 
+  def __addResourceLikeSection( self, resourcePath, resourceDict ):
+    """ Add one of Resource level entries ( site, resource, access point )
+    """
+    self.__csMod.createSection( resourcePath )
+    for property in resourceDict:
+      value = resourceDict[property]
+      if type( value ) in types.StringTypes:
+        self.__csMod.setOptionValue( "%s/%s" % ( resourcePath, property ), value )
+      elif type( value ) == types.ListType: 
+        optValue = ','.join(value)
+        self.__csMod.setOptionValue( "%s/%s" % ( resourcePath, property ), optValue )
+      elif type( value ) == types.DictType:   
+        self.__csMod.createSection( "%s/%s" % ( resourcePath, property ) )
+        for option in value:
+          newValue = value[option]
+          if type( newValue ) in types.StringTypes:
+            self.__csMod.setOptionValue( "%s/%s/%s" % ( resourcePath, property, option ), newValue )
+          elif type( value ) == types.ListType: 
+            optValue = ','.join( newValue)
+            self.__csMod.setOptionValue( "%s/%s/%s" % ( resourcePath, property, option ), optValue )
+    self.__csModified = True
+    return S_OK( True )        
+
+  def addSite( self, siteName, siteDict ):
+    """ Add a new Site to the CS
+    """
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
+    
+    sitePath = "%s/Sites/%s" % ( self.__baseResources, siteName )
+    if self.__csMod.existsSection( sitePath ):
+      return S_ERROR( 'Site %s already exists ' % siteName )
+    return self.__addResourceLikeSection( sitePath, siteDict )
+  
+  def addResource( self, siteName, resourceType, resourceName, resourceDict ):
+    """ Add a new Resource to the CS
+    """
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
+    sitePath = "%s/Sites/%s" % ( self.__baseResources, siteName )
+    if not self.__csMod.existsSection( sitePath ):
+      return S_ERROR( 'Site %s does not exist' % siteName )
+    resourcePath = "%s/Sites/%s/%s/%s" % ( self.__baseResources, siteName, resourceType, resourceName )
+    if self.__csMod.existsSection( resourcePath ):
+      return S_ERROR( '%s resource %s at site %s already exists' % ( resourceType, resourceName, siteName ) )
+    return self.__addResourceLikeSection( resourcePath, resourceDict )
+  
+  def addNode( self, siteName, resourceType, resourceName, apType, apName, apDict ):
+    """ Add a new site to the CS
+    """
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
+    sitePath = "%s/Sites/%s" % ( self.__baseResources, siteName )
+    if not self.__csMod.existsSection( sitePath ):
+      return S_ERROR( 'Site %s does not exist' % siteName )
+    resourcePath = "%s/Sites/%s/%s/%s" % ( self.__baseResources, siteName, resourceType, resourceName )
+    if not self.__csMod.existsSection( resourcePath ):
+      return S_ERROR( '%s resource %s at site %s does not exist' % ( resourceType, resourceName, siteName ) )
+    apPath = "%s/Sites/%s/%s/%s/%s/%s" % ( self.__baseResources, siteName, resourceType, resourceName, apType, apName )
+    if self.__csMod.existsSection( apPath ):
+      return S_ERROR( '%s access point %s at %s resource %s at site %s already exists ' % \
+                                              ( apType, apName, resourceType, resourceName, siteName ) )
+    return self.__addResourceLikeSection( apPath, apDict )
+    
+  def sortSection( self, section ):  
+    self.__csMod.sortAlphabetically( section )
+    
   def commitChanges( self, sortUsers = True ):
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     if self.__csModified:
       self.checkForUnexistantUsersInGroups()
       if sortUsers:
@@ -472,29 +547,27 @@ class CSAPI:
       if not retVal[ 'OK' ]:
         gLogger.error( "Can't commit new data: %s" % retVal[ 'Message' ] )
         return retVal
-      self.__csModified = False
       return self.downloadCSData()
     return S_OK()
 
   def commit( self ):
     """ Commit the accumulated changes to the CS server
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     if self.__csModified:
       retVal = self.__csMod.commit()
       if not retVal[ 'OK' ]:
         gLogger.error( "Can't commit new data: %s" % retVal[ 'Message' ] )
         return retVal
-      self.__csModified = False
       return self.downloadCSData()
     return S_OK()
 
   def mergeFromCFG( self, cfg ):
     """ Merge the internal CFG data with the input
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     self.__csMod.mergeFromCFG( cfg )
     self.__csModified = True
     return S_OK()
@@ -502,8 +575,8 @@ class CSAPI:
   def modifyValue( self, optionPath, newValue ):
     """Modify an existing value at the specified options path.
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     prevVal = self.__csMod.getValue( optionPath )
     if not prevVal:
       return S_ERROR( 'Trying to set %s to %s but option does not exist' % ( optionPath, newValue ) )
@@ -515,8 +588,8 @@ class CSAPI:
   def setOption( self, optionPath, optionValue ):
     """Create an option at the specified path.
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     self.__csMod.setOptionValue( optionPath, optionValue )
     self.__csModified = True
     return S_OK( 'Created new option %s = %s' % ( optionPath, optionValue ) )
@@ -525,17 +598,17 @@ class CSAPI:
   def setOptionComment( self, optionPath, comment ):
     """Create an option at the specified path.
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     self.__csMod.setComment( optionPath, comment )
     self.__csModified = True
     return S_OK( 'Set option comment %s : %s' % ( optionPath, comment ) )
 
-  def delOption( self, optionPath ):
-    """ Delete an option 
+  def deleteOption( self, optionPath ):
+    """ Delete an option
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     if not self.__csMod.removeOption( optionPath ):
       return S_ERROR( "Couldn't delete option %s" % optionPath )
     self.__csModified = True
@@ -544,27 +617,56 @@ class CSAPI:
   def createSection( self, sectionPath, comment = "" ):
     """ Create a new section
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     self.__csMod.createSection( sectionPath )
     self.__csModified = True
     if comment:
       self.__csMod.setComment( sectionPath, comment )
     return S_OK()
 
-  def delSection( self, sectionPath ):
+  def deleteSection( self, sectionPath ):
     """ Delete a section
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     if not self.__csMod.removeSection( sectionPath ):
       return S_ERROR( "Could not delete section %s " % sectionPath )
+    self.__csModified = True
+    return S_OK()
+  
+  def copySection( self, originalPath, targetPath ):
+    """ Copy a whole section to a new location
+    """
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
+    cfg = self.__csMod.getCFG()
+    sectionCfg = cfg[originalPath]
+    result = self.createSection( targetPath )
+    if not result[ 'OK' ]:
+      return result
+    if not self.__csMod.mergeSectionFromCFG( targetPath, sectionCfg ):
+      return S_ERROR( "Could not merge cfg into section %s" % targetPath )
+    self.__csModified = True
+    return S_OK()
+    
+  def moveSection( self, originalPath, targetPath ):  
+    """  Move a whole section to a new location
+    """
+    result = self.copySection( originalPath, targetPath )
+    if not result['OK']:
+      return result
+    result = self.deleteSection( originalPath )
+    if not result[ 'OK' ]:
+      return result
     self.__csModified = True
     return S_OK()
 
   def mergeCFGUnderSection( self, sectionPath, cfg ):
     """ Merge the given cfg under a certain section
     """
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     result = self.createSection( sectionPath )
     if not result[ 'OK' ]:
       return result
@@ -576,8 +678,8 @@ class CSAPI:
   def mergeWithCFG( self, cfg ):
     """ Merge the given cfg with the current config
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     self.__csMod.mergeFromCFG( cfg )
     self.__csModified = True
     return S_OK()
@@ -585,8 +687,8 @@ class CSAPI:
   def getCurrentCFG( self ):
     """ Get the current CFG as it is
     """
-    if not self.__initialized:
-      return S_ERROR( "CSAPI didn't initialize properly" )
+    if not self.__initialized[ 'OK' ]:
+      return self.__initialized
     return S_OK( self.__csMod.getCFG() )
 
 

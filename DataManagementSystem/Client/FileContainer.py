@@ -4,11 +4,16 @@ __RCSID__ = "$Id$"
 """ This module contains classes associated to Files.
 
     The File class contains the member elements: LFN, Status, Size, GUID and Checksum and provides access methods for each (inluding type checking).
+
+PROBABLY OBSOLETE
+K.C.
+
 """
 
 import types
 from DIRAC import S_OK, S_ERROR
-from DIRAC.DataManagementSystem.Client.ReplicaManager import CatalogFile
+from DIRAC.Resources.Catalog.FileCatalog               import FileCatalog
+from DIRAC.Resources.Utilities                         import Utils
 from DIRAC.DataManagementSystem.Client.ReplicaContainers import CatalogReplica
 from DIRAC.Core.Utilities.CFG import CFG
 
@@ -33,6 +38,7 @@ class File:
       raise AttributeError, "checksum should be string type"
     self.checksum = str(checksum)
     self.catalogReplicas = []
+    self.fc = FileCatalog()
 
   def setLFN(self,lfn):
     if not type(lfn) in types.StringTypes: 
@@ -117,8 +123,7 @@ class File:
     return S_OK(self.checksum)
 
   def __populateMetadata(self):
-    oCatalog = CatalogFile()
-    res = oCatalog.getCatalogFileMetadata(self.lfn,singleFile=True)
+    res = Utils.executeSingleFileOrDirWrapper( self.fc.getFileMetadata( self.lfn ) )
     if not res['OK']:
       return res
     metadata = res['Value']
@@ -145,8 +150,7 @@ class File:
       for replica in self.catalogReplicas:
         replicas[replica.se] = replica.pfn
       return S_OK(replicas)
-    oCatalog = CatalogFile()
-    res = oCatalog.getCatalogReplicas(self.lfn,singleFile=True)
+    res = Utils.executeSingleFileOrDirWrapper( self.fc.getCatalogReplicas( self.lfn ) )
     if not res['OK']:
       return res
     replicas = res['Value']

@@ -1,13 +1,15 @@
 # $HeadURL$
 __RCSID__ = "$Id$"
 
-import time
-import random
+import time, random, copy
 from DIRAC import S_OK, S_ERROR, gLogger, gConfig
-from DIRAC.Core.DISET.RPCClient import RPCClient
-from DIRAC.Core.Utilities.ThreadSafe import Synchronizer
-from DIRAC.RequestManagementSystem.Client.RequestContainer import RequestContainer
-from DIRAC.RequestManagementSystem.Client.RequestClient import RequestClient
+from DIRAC.Core.DISET.RPCClient                     import RPCClient
+from DIRAC.Core.Utilities.ThreadSafe                import Synchronizer
+from DIRAC.Core.Utilities                           import DEncode
+from DIRAC.RequestManagementSystem.Client.Request   import Request
+from DIRAC.RequestManagementSystem.Client.Operation import Operation
+from DIRAC.RequestManagementSystem.Client.ReqClient import ReqClient
+
 
 gAccountingSynchro = Synchronizer()
 random.seed()
@@ -21,7 +23,7 @@ class DataStoreClient:
   """
   def __init__( self, setup = False, retryGraceTime = 0 ):
     self.__setup = setup
-    self.__maxRecordsInABundle = 100
+    self.__maxRecordsInABundle = 5000
     self.__registersList = []
     self.__maxTimeRetrying = retryGraceTime
     self.__lastSuccessfulCommit = time.time()
@@ -56,7 +58,7 @@ class DataStoreClient:
       return retVal
     if gConfig.getValue( '/LocalSite/DisableAccounting', False ):
       return S_OK()
-    self.__registersList.append( register.getValues() )
+    self.__registersList.append( copy.deepcopy( register.getValues() ) )
     return S_OK()
 
   def disableFailover( self ):
@@ -102,16 +104,25 @@ class DataStoreClient:
       return retVal
     if gConfig.getValue( '/LocalSite/DisableAccounting', False ):
       return S_OK()
-    return self.__getRPCClient().remove( register.getValues() )
+    return self.__getRPCClient().remove( *register.getValues() )
+
+  def ping( self ):
+    """
+    Ping the DataStore service
+    """
+    return self.__getRPCClient().ping()
 
 def _sendToFailover( rpcStub ):
-  requestClient = RequestClient()
-  request = RequestContainer()
-  request.setDISETRequest( rpcStub )
+  """ Create a ForwardDISET operation for failover
+  """
+  request = Request()
+  request.RequestName = "Accounting.DataStore.%s.%s" % ( time.time(), random.random() )
+  forwardDISETOp = Operation()
+  forwardDISETOp.Type = "ForwardDISET"
+  forwardDISETOp.Arguments = DEncode.encode( rpcStub )
+  request.addOperation( forwardDISETOp )
 
-  requestStub = request.toXML()['Value']
-  return requestClient.setRequest( "Accounting.DataStore.%s.%s" % ( time.time(), random.random() ),
-                                   requestStub )
+  return ReqClient().putRequest( request )
 
 
 gDataStoreClient = DataStoreClient()

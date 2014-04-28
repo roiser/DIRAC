@@ -1,10 +1,6 @@
 #!/usr/bin/env python
 from DIRAC.Core.Base.Script import parseCommandLine
 parseCommandLine()
-########################################################################
-# $HeadURL: svn+ssh://svn.cern.ch/reps/dirac/LHCbDIRAC/trunk/LHCbDIRAC/TransformationSystem/scripts/dirac-transformation-archive.py $
-########################################################################
-__RCSID__ = "$Id: dirac-transformation-archive.py 29046 2010-10-05 16:27:16Z acsmith $"
 
 import sys
 if len( sys.argv ) < 2:
@@ -19,7 +15,9 @@ from DIRAC.TransformationSystem.Client.TransformationClient           import Tra
 from DIRAC                                                            import gLogger
 import DIRAC
 
-agent = TransformationCleaningAgent( 'Transformation/TransformationCleaningAgent', 'dirac-transformation-archive' )
+agent = TransformationCleaningAgent( 'Transformation/TransformationCleaningAgent',
+                                     'Transformation/TransformationCleaningAgent',
+                                     'dirac-transformation-archive' )
 agent.initialize()
 
 client = TransformationClient()

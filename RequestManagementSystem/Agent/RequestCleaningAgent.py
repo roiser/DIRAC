@@ -4,12 +4,14 @@
 
 """  The RequestCleaning agent removes the already executed requests from the database after
      a grace period.
+
+    :deprecated:
 """
 
 from DIRAC  import gLogger, S_OK, S_ERROR
 from DIRAC.Core.Base.AgentModule import AgentModule
 from DIRAC.RequestManagementSystem.Client.RequestClient import RequestClient
-from DIRAC.Core.Utilities.Time import dateTime,day
+from DIRAC.Core.Utilities.Time import dateTime,day,second
 
 __RCSID__ = "$Id: $"
 

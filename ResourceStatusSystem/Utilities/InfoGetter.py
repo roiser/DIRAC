@@ -1,258 +1,222 @@
-################################################################################
-# $HeadURL:  $
-################################################################################
-__RCSID__ = "$Id:  $"
+# $HeadURL: $
+""" InfoGetter
+
+  Module used to match the decision parameters with the CS. In general terms, the
+  decision parameters dictionary looks like ( but does not need to contain all
+  key-value pairs ):
+  
+  {
+    'element'     : str | None | list( str ),
+    'name'        : ..same..
+    'elementType' : ..same..
+    'statusType'  : ..same..
+    'status'      : ..same..
+    'reason'      : ..same..
+    'tokenOwner'  : ..same..
+    'active'      : 'Active' / something else
+  }
+
+"""
 
 import copy
 
-from DIRAC.ResourceStatusSystem.Utilities.CS import getTypedDictRootedAt
-from DIRAC.ResourceStatusSystem.Utilities    import Utils
-from DIRAC.ResourceStatusSystem              import views_panels
+from DIRAC                                import S_OK
+from DIRAC.ResourceStatusSystem.Utilities import RssConfiguration, Utils
+
+__RCSID__ = '$Id: $'
+
 
 class InfoGetter:
-  """ Class InfoGetter is in charge of getting information from the RSS Configurations
+  """ InfoGetter
   """
 
-  def __init__(self):
-    configModule    = Utils.voimport("DIRAC.ResourceStatusSystem.Policy.Configurations")
-    self.C_Policies = copy.deepcopy(configModule.Policies)
-
-################################################################################
-
-  def getInfoToApply( self, args, granularity, statusType = None, status = None,
-                      formerStatus = None, siteType = None, serviceType = None,
-                      resourceType = None, useNewRes = False ):
-    """ Main method. Use internal methods to parse information regarding:
-        policies to be applied, policy types, panel and view info.
-
-        :params:
-          :attr:`args`: a tuple. Can contain: 'policy', 'policyType', 'panel_info', 'view_info'
-
-          :attr:`granularity`: a ValidRes
-
-          :attr:`status`: a ValidStatus
-
-          :attr:`formerStatus`: a ValidStatus
-
-          :attr:`siteType`: a ValidSiteType
-
-          :attr:`serviceType`: a ValidServiceType
-
-          :attr:`resourceType`: a ValidSiteType
+  def __init__( self ):
+    """ Constructor. Imports the policy configurations containing the command
+    information, among other things. 
+    
+    examples:
+      >>> iGetter = InfoGetter()
+    
     """
+        
+    configModule  = Utils.voimport( 'DIRAC.ResourceStatusSystem.Policy.Configurations' )
+    self.policies = copy.deepcopy( configModule.POLICIESMETA )  
 
-    EVAL = {}
 
-    if 'policy' in args:
-      EVAL['Policies'] = self.__getPolToEval( granularity = granularity, statusType = statusType,
-                                              status = status, formerStatus = formerStatus,
-                                              siteType = siteType, serviceType = serviceType,
-                                              resourceType = resourceType, useNewRes = useNewRes)
-
-    if 'policyType' in args:
-      EVAL['PolicyType'] = self.__getPolTypes( granularity = granularity, statusType = statusType,
-                                               status = status, formerStatus = formerStatus,
-                                               siteType = siteType, serviceType = serviceType,
-                                               resourceType = resourceType)
-
-    if 'panel_info' in args:
-      if granularity in ('Site', 'Sites'):
-        info = 'Site_Panel'
-      elif granularity in ('Service', 'Services'):
-        if serviceType == 'Storage':
-          info = 'Service_Storage_Panel'
-        elif serviceType == 'Computing':
-          info = 'Service_Computing_Panel'
-        elif serviceType == 'VO-BOX':
-          info = 'Service_VO-BOX_Panel'
-        elif serviceType == 'VOMS':
-          info = 'Service_VOMS_Panel'
-      elif granularity in ('Resource', 'Resources'):
-        info = 'Resource_Panel'
-      elif granularity in ('StorageElementRead', 'StorageElementsRead'):
-        info = 'SE_Panel'
-      elif granularity in ('StorageElementWrite', 'StorageElementsWrite'):
-        info = 'SE_Panel'
-      EVAL['Info'] = self.__getPanelsInfo( granularity = granularity, statusType = statusType,
-                                           status = status, formerStatus = formerStatus,
-                                           siteType = siteType, serviceType = serviceType,
-                                           resourceType = resourceType, panel_name = info,
-                                           useNewRes = useNewRes )
-
-    if 'view_info' in args:
-      panels_info_dict = {}
-
-      if granularity in ('Site', 'Sites'):
-        granularity = None
-
-      view_panels = self.__getViewPanels(granularity)
-      for panel in view_panels:
-        panel_info = self.__getPanelsInfo( granularity = granularity, statusType = statusType,
-                                           status = status, formerStatus = formerStatus,
-                                           siteType = siteType, serviceType = serviceType,
-                                           resourceType = resourceType, panel_name = panel,
-                                           useNewRes = useNewRes )
-        panels_info_dict[panel] = panel_info
-
-      EVAL['Panels'] = panels_info_dict
-
-    return EVAL
-
-################################################################################
-
-  def __getPolToEval( self, granularity, statusType = None, status=None,
-                      formerStatus=None, siteType=None, serviceType=None,
-                      resourceType=None, useNewRes=False ):
-    """Returns a possibly empty list of dicts, each dict containing
-    enough information to evaluate a given policy"""
-
-    # This dict is constructed to be used with function dictMatch that
-    # helps selecting policies. **kwargs are not used due to the fact
-    # that it's too dangerous here.
-    argsdict = { 'Granularity'  : granularity,
-                 'StatusType'   : statusType,
-                 'Status'       : status,
-                 'FormerStatus' : formerStatus,
-                 'SiteType'     : siteType,
-                 'ServiceType'  : serviceType,
-                 'ResourceType' : resourceType }
-
-    pConfig = getTypedDictRootedAt("Policies")
-    pol_to_eval = (p for p in pConfig if Utils.dictMatch(argsdict, pConfig[p]))
-    polToEval_Args = []
-
-    for p in pol_to_eval:
+  def getPoliciesThatApply( self, decisionParams ):
+    """ Given a dictionary, it matches it against all the policies configuration
+    dictionaries as they are on the CS. Returns the policy dictionaries that 
+    produced a positive match plus their configuration in <self.policies>. 
+    
+    examples:
+      >>> # This matches all policies !
+      >>> iGetter.getPoliciesThatApply( {} )
+          [ { 
+             'name'        : 'AlwaysActiveForResource',
+             'type'        : 'AlwaysActive',
+             'module'      : 'AlwaysActivePolicy',
+             'description' : 'This is the AlwaysActive policy'
+             'command'     : None,
+             'args'        : {}
+            },... ]
+      >>> # There is no policy that matches BlahSite      
+      >>> iGetter.getPoliciesThatApply( { 'name' : 'BlahSite' } )
+          []
+    
+    :Parameters:
+      **decisionParams** - `dict`
+        dictionary with the parameters to match policies.
+        
+    :return: S_OK() / S_ERROR
+    
+    """
+    
+    policiesToBeLoaded = []
+    
+    # Get policies configuration metadata from CS.
+    policiesConfig = RssConfiguration.getPolicies()
+    if not policiesConfig[ 'OK' ]:
+      return policiesConfig
+    policiesConfig = policiesConfig[ 'Value' ]
+    
+    # Get policies that match the given decissionParameters
+    for policyName, policySetup in policiesConfig.iteritems():
+          
+      # The section matchParams is not mandatory, so we set {} as default.
+      policyMatchParams = policySetup.get( 'matchParams',  {} )   
+      if not Utils.configMatch( decisionParams, policyMatchParams ):
+        continue
+        
+      # the policyName replaces the policyTipe if not present. This allows us to
+      # define several policies of the same type on the CS. We just need to
+      # give them different names and assign them the same policyType. 
       try:
-        moduleName = self.C_Policies[p]['module']
+        policyType = policySetup[ 'policyType' ][ 0 ]
       except KeyError:
-        moduleName = None
+        policyType = policyName
+      
+      policyDict = {
+                     'name' : policyName, 
+                     'type' : policyType,
+                     'args' : {}
+                   }
+      
+      # Get policy static configuration        
       try:
-        ConfirmationPolicy = self.C_Policies[p]['ConfirmationPolicy']
+        policyDict.update( self.policies[ policyType ] )
       except KeyError:
-        ConfirmationPolicy = None
+        continue  
+      
+      policiesToBeLoaded.append( policyDict )
+       
+    return S_OK( policiesToBeLoaded )    
+    
 
-      if useNewRes:
-        try:
-          commandIn = self.C_Policies[p]['commandInNewRes']
-        except KeyError:
-          commandIn = self.C_Policies[p]['commandIn']
-        try:
-          args = self.C_Policies[p]['argsNewRes']
-        except KeyError:
-          args = self.C_Policies[p]['args']
-      else:
-        commandIn = self.C_Policies[p]['commandIn']
-        args = self.C_Policies[p]['args']
+  def getPolicyActionsThatApply( self, decisionParams, singlePolicyResults, policyCombinedResults ):
+    """ Method that returns the actions to be triggered based on the original 
+    decision parameters ( decisionParams ), which also can apply to the method
+    `getPoliciesThatApply`, each one of the policy results ( singlePolicyResults )
+    and the combined policy results ( policyCombinedResults ) as computed on the `PDP`.
+    
+    examples:
+      >>> iGetter.getPolicyActionsThatApply( { 'name' : 'SiteA' },[],{} )[ 'Value' ]
+          [ ( 'BanSiteA', 'BanSite' ) ]
+      >>> iGetter.getPolicyActionsThatApply( { 'name' : 'SiteA' },[],
+                                             { 'Status' : 'Active', 'Reason' : 'Blah' } )[ 'Value' ]
+          [ ( 'BanSiteA', 'BanSite' ), ( 'EmailActive2Banned', 'EmailAction' ) ]    
+      
+    :Parameters:
+      **decisionParams** - `dict`  
+        dictionary with the parameters to match policies ( and actions in this case )
+      **singlePolicyResults** - `list( dict )`
+        list containing the dictionaries returned by the policies evaluated
+      **policyCombinedResults** - `dict`
+        dictionary containing the combined result of the policies evaluation
+    
+    :return: S_OK( list ) / S_ERROR
+        
+    """
+    
+    policyActionsThatApply = []
+    
+    # Get policies configuration metadata from CS.
+    policyActionsConfig = RssConfiguration.getPolicyActions()
+    if not policyActionsConfig[ 'OK' ]:
+      return policyActionsConfig
+    policyActionsConfig = policyActionsConfig[ 'Value' ]
+    
+    # Let's create a dictionary to use it with configMatch
+    policyResults = self._getPolicyResults( singlePolicyResults )
+    
+    # Get policies that match the given decissionParameters
+    for policyActionName, policyActionConfig in policyActionsConfig.iteritems():
+      
+      # The parameter policyType is mandatory. If not present, we pick policyActionName
+      try:
+        policyActionType = policyActionConfig[ 'actionType' ][ 0 ]
+      except KeyError:
+        policyActionType = policyActionName
+      
+      # We get matchParams to be compared against decissionParams
+      policyActionMatchParams = policyActionConfig.get( 'matchParams', {} )
+      if not Utils.configMatch( decisionParams, policyActionMatchParams ):
+        continue
+    
+      # Let's check single policy results
+      # Assumed structure:
+      # ...
+      # policyResults
+      # <PolicyName> = <PolicyResult1>,<PolicyResult2>...
+      policyActionPolicyResults = policyActionConfig.get( 'policyResults', {} )
+      if not Utils.configMatch( policyResults, policyActionPolicyResults ):
+        continue
+      
+      # combinedResult
+      # \Status = X,Y
+      # \Reason = asdasd,asdsa
+      policyActionCombinedResult = policyActionConfig.get( 'combinedResult', {} )
+      if not Utils.configMatch( policyCombinedResults, policyActionCombinedResult ):
+        continue
+            
+      # They may not be necessarily the same
+      policyActionsThatApply.append( ( policyActionName, policyActionType ) )    
+      
+    return S_OK( policyActionsThatApply )
 
-      polToEval_Args.append({'Name' : p, 'Module' : moduleName, 'args' : args,
-                             'ConfirmationPolicy' : ConfirmationPolicy,
-                             'commandIn' : commandIn})
 
-    return polToEval_Args
-
-################################################################################
-
-  def __getPolTypes( self, granularity, statusType=None, status=None,
-                     formerStatus=None, newStatus=None, siteType=None,
-                     serviceType=None, resourceType=None ):
-    """Get Policy Types from config that match the given keyword
-    arguments. Always returns a generator object, possibly empty."""
-
-    # This dict is constructed to be used with function dictMatch that
-    # helps selecting policies. **kwargs are not used due to the fact
-    # that it's too dangerous here.
-    argsdict = {'Granularity'  : granularity,
-                'StatusType'   : statusType,
-                'Status'       : status,
-                'FormerStatus' : formerStatus,
-                'NewStatus'    : newStatus,
-                'SiteType'     : siteType,
-                'ServiceType'  : serviceType,
-                'ResourceType' : resourceType }
-
-    pTconfig = getTypedDictRootedAt("PolicyTypes")
-    return (pt for pt in pTconfig if Utils.dictMatch(argsdict, pTconfig[pt]))
-
-  def getNewPolicyType(self, granularity, newStatus):
-    return self.__getPolTypes(granularity = granularity, newStatus = newStatus)
-
-################################################################################
-
-  def __getPanelsInfo( self, granularity, statusType = None, status = None,
-                       formerStatus = None, siteType = None, serviceType = None,
-                       resourceType = None, panel_name = None, useNewRes = False ):
-
-    info = []
-
-    # First, select only policies we want.
-    argsdict = {'Granularity'  : granularity,
-                'StatusType'   : statusType,
-                'Status'       : status,
-                'FormerStatus' : formerStatus,
-                'SiteType'     : siteType,
-                'ServiceType'  : serviceType,
-                'ResourceType' : resourceType}
+  @staticmethod
+  def _getPolicyResults( singlePolicyResults ):
+    """ Method that transforms a list of dictionaries into a dictionary containing
+    the policy names as keys and the status they propose as value.
+    
+    examples:
+      >>> iGetter._getPolicyResults( [ { 'Status' : 'A',
+                                         'Policy' : {
+                                                      'name' : 'policyName',
+                                                      ...                                          
+                                                    }
+                                       }, ... ] )
+          { 'policyName' : 'A' }                             
+    
+    :Parameters:
+      **singlePolicyResults** - `list( dict )`
+        list of dictionaries containing the policies returned values
+    
+    :return: dict
+    
+    """
+    
+    # Let's create a dictionary to use it with configMatch
+    policyResults = {}
+    
+    for policyResult in singlePolicyResults:
+      try:
+        policyResults[ policyResult[ 'Policy' ][ 'name' ] ] = policyResult[ 'Status' ]
+      except KeyError:
+        continue
+      
+    return policyResults  
 
 
-    all_policies = getTypedDictRootedAt("Policies")
-    selected_policies = []
-    for p in all_policies:
-      if Utils.dictMatch(argsdict, all_policies[p]):
-        selected_policies.append(p)
-
-    for p in selected_policies:                   # For selected policies
-      if panel_name in self.C_Policies[p].keys(): # For selected panel_name (arguments)
-
-        toAppend = copy.deepcopy(self.C_Policies[p][panel_name]) # type(toAppend) = list
-
-        # Put CommandIn and args to correct values according to useNewRes
-        if useNewRes:
-          for panel in toAppend:
-            for info_type in panel.keys():
-
-              if type(panel[info_type]) == dict:
-                try:
-                  panel[info_type]['CommandIn'] = panel[info_type]['CommandInNewRes']
-                  del panel[info_type]['CommandInNewRes']
-                except KeyError:
-                  pass
-                try:
-                  panel[info_type]['args'] = panel[info_type]['argsNewRes']
-                  del panel[info_type]['argsNewRes']
-                except KeyError:
-                  pass
-        else:
-          for panel in toAppend:
-            for info_type in panel.keys():
-              try:
-                del panel[info_type]['CommandInNewRes']
-              except KeyError:
-                pass
-              try:
-                del panel[info_type]['argsNewRes']
-              except KeyError:
-                pass
-
-        info.append({p:toAppend})
-
-    return info
-
-################################################################################
-
-  def __getViewPanels( self, granularity ):
-    if granularity is None:
-      granularity = 'Site'
-    return views_panels[granularity]
-
-################################################################################
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-################################################################################
-
-'''
-  HOW DOES THIS WORK.
-
-    will come soon...
-'''
-
-################################################################################
+#...............................................................................
 #EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF#EOF

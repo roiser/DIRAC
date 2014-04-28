@@ -10,6 +10,7 @@ from DIRAC.Core.Utilities.ReturnValues import S_ERROR, S_OK
 from DIRAC.Core.DISET.private.Transports.BaseTransport import BaseTransport
 from DIRAC.FrameworkSystem.Client.Logger import gLogger
 from DIRAC.Core.DISET.private.Transports.SSL.SocketInfoFactory import gSocketInfoFactory
+from DIRAC.Core.Utilities.Devloader import Devloader
 from DIRAC.Core.Security import Locations
 from DIRAC.Core.Security.X509Chain import X509Chain
 from DIRAC.Core.Security.X509Certificate import X509Certificate
@@ -18,7 +19,7 @@ GSI.SSL.set_thread_safe()
 
 class SSLTransport( BaseTransport ):
 
-  __readWriteLock = LockRing().getLock( "DISET.SSLTrans.RW" )
+  __readWriteLock = LockRing().getLock()
 
   def __init__( self, *args, **kwargs ):
     self.__writesDone = 0
@@ -64,12 +65,14 @@ class SSLTransport( BaseTransport ):
       return retVal
     self.oSocketInfo = retVal[ 'Value' ]
     self.oSocket = self.oSocketInfo.getSSLSocket()
+    Devloader().addStuffToClose( self.oSocket )
     return S_OK()
 
   def close( self ):
     gLogger.debug( "Closing socket" )
     try:
-      self.oSocket.shutdown()
+      #self.oSocket.shutdown()
+      os.fsync( self.oSocket.fileno() )
       self.oSocket.close()
     except:
       pass

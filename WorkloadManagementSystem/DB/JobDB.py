@@ -1,7 +1,3 @@
-########################################################################
-# $HeadURL$
-########################################################################
-
 """ DIRAC JobDB class is a front-end to the main WMS database containing
     job definitions and status information. It is used in most of the WMS
     components
@@ -49,26 +45,26 @@
 __RCSID__ = "$Id$"
 
 import sys, types
-import time, operator
+import operator
 
-from DIRAC.Core.Utilities.ClassAd.ClassAdLight               import ClassAd
-from DIRAC                                                   import S_OK, S_ERROR, Time
-from DIRAC.ConfigurationSystem.Client.Config                 import gConfig
-from DIRAC.ConfigurationSystem.Client.Helpers.Registry       import getVOForGroup, getVOOption
-from DIRAC.Core.Base.DB                                      import DB
-from DIRAC.Core.Security.CS                                  import getUsernameForDN, getDNForUsername
-from DIRAC.WorkloadManagementSystem.Client.JobDescription    import JobDescription
+from DIRAC                                                       import S_OK, S_ERROR, Time
+from DIRAC.ConfigurationSystem.Client.Config                     import gConfig
+from DIRAC.ConfigurationSystem.Client.Helpers                    import Registry
+from DIRAC.Core.Base.DB                                          import DB
+from DIRAC.ConfigurationSystem.Client.Helpers.Resources          import getSites
+from DIRAC.ResourceStatusSystem.Client.SiteStatus                import SiteStatus
+from DIRAC.WorkloadManagementSystem.Client.JobState.JobManifest  import JobManifest
+from DIRAC.Core.Utilities                                        import Time
 
-DEBUG = 0
+DEBUG = False
 JOB_STATES = ['Received', 'Checking', 'Staging', 'Waiting', 'Matched',
               'Running', 'Stalled', 'Done', 'Completed', 'Failed']
 JOB_FINAL_STATES = ['Done', 'Completed', 'Failed']
 
 JOB_DEPRECATED_ATTRIBUTES = [ 'UserPriority', 'SystemPriority' ]
 
-JOB_STATIC_ATTRIBUTES = [ 'JobID', 'JobType', 'DIRACSetup', 'JobGroup', 'JobSplitType', 'MasterJobID',
-                          'JobName', 'Owner', 'OwnerDN', 'OwnerGroup', 'SubmissionTime', 'VerifiedFlag',
-                          'RunNumber' ]
+JOB_STATIC_ATTRIBUTES = [ 'JobID', 'JobType', 'DIRACSetup', 'JobGroup', 'HerdState', 'MasterJobID',
+                          'JobName', 'Owner', 'OwnerDN', 'OwnerGroup', 'SubmissionTime', 'VerifiedFlag' ]
 
 JOB_VARIABLE_ATTRIBUTES = [ 'Site', 'RescheduleTime', 'StartExecTime', 'EndExecTime', 'RescheduleCounter',
                            'DeletedFlag', 'KilledFlag', 'FailedFlag',
@@ -77,17 +73,210 @@ JOB_VARIABLE_ATTRIBUTES = [ 'Site', 'RescheduleTime', 'StartExecTime', 'EndExecT
 JOB_DYNAMIC_ATTRIBUTES = [ 'LastUpdateTime', 'HeartBeatTime',
                            'Status', 'MinorStatus', 'ApplicationStatus', 'ApplicationNumStatus', 'CPUTime'
                           ]
-if DEBUG:
-  gDebugFile = open( "JobDB.debug.log", "w" )
 
 #############################################################################
 class JobDB( DB ):
+
+  _tablesDict = {}
+  # Jobs table
+  _tablesDict[ 'Jobs' ] = {
+                           'Fields' :
+                                     {
+                                      'JobID'                : 'INTEGER NOT NULL AUTO_INCREMENT',
+                                      'JobType'              : 'VARCHAR(32) NOT NULL DEFAULT "normal"',
+                                      'DIRACSetup'           : 'VARCHAR(32) NOT NULL',
+                                      'JobGroup'             : 'VARCHAR(32) NOT NULL DEFAULT "NoGroup"',
+                                      'JobSplitType'         : 'ENUM ("Single","Master","Subjob","DAGNode") NOT NULL DEFAULT "Single"',
+                                      'MasterJobID'          : 'INTEGER NOT NULL DEFAULT 0',
+                                      'Site'                 : 'VARCHAR(100) NOT NULL DEFAULT "ANY"',
+                                      'JobName'              : 'VARCHAR(128) NOT NULL DEFAULT "Unknown"',
+                                      'Owner'                : 'VARCHAR(32) NOT NULL DEFAULT "Unknown"',
+                                      'OwnerDN'              : 'VARCHAR(255) NOT NULL DEFAULT "Unknown"',
+                                      'OwnerGroup'           : 'VARCHAR(128) NOT NULL DEFAULT "lhcb_user"',
+                                      'SubmissionTime'       : 'DATETIME',
+                                      'RescheduleTime'       : 'DATETIME',
+                                      'LastUpdateTime'       : 'DATETIME',
+                                      'StartExecTime'        : 'DATETIME',
+                                      'HeartBeatTime'        : 'DATETIME',
+                                      'EndExecTime'          : 'DATETIME',
+                                      'Status'               : 'VARCHAR(32) NOT NULL DEFAULT "Received"',
+                                      'MinorStatus'          : 'VARCHAR(128) NOT NULL DEFAULT "Initial insertion"',
+                                      'ApplicationStatus'    : 'VARCHAR(256) NOT NULL DEFAULT "Unknown"',
+                                      'ApplicationNumStatus' : 'INTEGER NOT NULL DEFAULT 0',
+                                      'CPUTime'              : 'FLOAT NOT NULL DEFAULT 0.0',
+                                      'UserPriority'         : 'INTEGER NOT NULL DEFAULT 0',
+                                      'SystemPriority'       : 'INTEGER NOT NULL DEFAULT 0',
+                                      'RescheduleCounter'    : 'INTEGER NOT NULL DEFAULT 0',
+                                      'VerifiedFlag'         : 'ENUM ("True","False") NOT NULL DEFAULT "False"',
+                                      'DeletedFlag'          : 'ENUM ("True","False") NOT NULL DEFAULT "False"',
+                                      'KilledFlag'           : 'ENUM ("True","False") NOT NULL DEFAULT "False"',
+                                      'FailedFlag'           : 'ENUM ("True","False") NOT NULL DEFAULT "False"',
+                                      'ISandboxReadyFlag'    : 'ENUM ("True","False") NOT NULL DEFAULT "False"',
+                                      'OSandboxReadyFlag'    : 'ENUM ("True","False") NOT NULL DEFAULT "False"',
+                                      'RetrievedFlag'        : 'ENUM ("True","False") NOT NULL DEFAULT "False"',
+                                      'AccountedFlag'        : 'ENUM ("True","False","Failed") NOT NULL DEFAULT "False"'
+                                     },
+                           'Indexes' :
+                                      {
+                                       'JobType'           : [ 'JobType' ],
+                                       'DIRACSetup'        : [ 'DIRACSetup' ],
+                                       'JobGroup'          : [ 'JobGroup' ],
+                                       'JobSplitType'      : [ 'JobSplitType' ],
+                                       'Site'              : [ 'Site' ],
+                                       'Owner'             : [ 'Owner' ],
+                                       'OwnerDN'           : [ 'OwnerDN' ],
+                                       'OwnerGroup'        : [ 'OwnerGroup' ],
+                                       'Status'            : [ 'Status' ],
+                                       'StatusSite'        : [ 'Status', 'Site' ],
+                                       'MinorStatus'       : [ 'MinorStatus' ],
+                                       'ApplicationStatus' : [ 'ApplicationStatus' ]
+                                      },
+                           'PrimaryKey' : [ 'JobID' ]
+                          }
+  # JobJDLs table
+  _tablesDict[ 'JobJDLs' ] = {
+                              'Fields' :
+                                        {
+                                         'JobID'           : 'INTEGER NOT NULL AUTO_INCREMENT',
+                                         'JDL'             : 'BLOB NOT NULL',
+                                         'JobRequirements' : 'BLOB NOT NULL',
+                                         'OriginalJDL'     : 'BLOB NOT NULL',
+
+                                        },
+                              'PrimaryKey' : [ 'JobID' ]
+                             }
+  # SubJobs table
+  _tablesDict[ 'SubJobs' ] = {
+                              'Fields' :
+                                        {
+                                         'JobID'    : 'INTEGER NOT NULL',
+                                         'SubJobID' : 'INTEGER NOT NULL',
+                                        }
+                             }
+  # PrecursorJobs table
+  _tablesDict[ 'PrecursorJobs' ] = {
+                                    'Fields' :
+                                              {
+                                               'JobID'    : 'INTEGER NOT NULL',
+                                               'PreJobID' : 'INTEGER NOT NULL',
+                                              }
+                                   }
+  # InputData table
+  _tablesDict[ 'InputData' ] = {
+                                'Fields' :
+                                          {
+                                           'JobID'  : 'INTEGER NOT NULL',
+                                           'Status' : 'VARCHAR(32) NOT NULL DEFAULT "AprioriGood"',
+                                           'LFN'    : 'VARCHAR(255)'
+                                          },
+                                'PrimaryKey' : [ 'JobID', 'LFN' ]
+                               }
+  # JobParameters table
+  _tablesDict[ 'JobParameters' ] = {
+                                    'Fields' :
+                                              {
+                                               'JobID' : 'INTEGER NOT NULL',
+                                               'Name'  : 'VARCHAR(100) NOT NULL',
+                                               'Value' : 'BLOB NOT NULL'
+                                              },
+                                    'PrimaryKey' : [ 'JobID', 'Name' ]
+                                   }
+  # OptimizerParameters table
+  _tablesDict[ 'OptimizerParameters' ] = {
+                                          'Fields' :
+                                                    {
+                                                     'JobID' : 'INTEGER NOT NULL',
+                                                     'Name'  : 'VARCHAR(100) NOT NULL',
+                                                     'Value' : 'MEDIUMBLOB NOT NULL'
+                                                    },
+                                          'PrimaryKey' : [ 'JobID', 'Name' ]
+                                         }
+  # AtticJobParameters table
+  _tablesDict[ 'AtticJobParameters' ] = {
+                                         'Fields' :
+                                                   {
+                                                    'JobID'           : 'INTEGER NOT NULL',
+                                                    'RescheduleCycle' : 'INTEGER NOT NULL',
+                                                    'Name'            : 'VARCHAR(100) NOT NULL',
+                                                    'Value'           : 'BLOB NOT NULL'
+                                                   },
+                                         'PrimaryKey' : [ 'JobID', 'Name', 'RescheduleCycle' ]
+                                        }
+  # TaskQueues table
+  _tablesDict[ 'TaskQueues' ] = {
+                                 'Fields' :
+                                           {
+                                            'TaskQueueID'  : 'INTEGER NOT NULL AUTO_INCREMENT',
+                                            'Priority'     : 'INTEGER NOT NULL DEFAULT 0',
+                                            'Requirements' : 'BLOB NOT NULL',
+                                            'NumberOfJobs' : 'INTEGER NOT NULL DEFAULT 0'
+                                           },
+                                 'PrimaryKey' : [ 'TaskQueueID' ]
+                                }
+  # TaskQueue table
+  _tablesDict[ 'TaskQueue' ] = {
+                                'Fields' :
+                                          {
+                                           'TaskQueueID' : 'INTEGER NOT NULL',
+                                           'JobID'       : 'INTEGER NOT NULL',
+                                           'Rank'        : 'INTEGER NOT NULL DEFAULT 0'
+                                          },
+                                'PrimaryKey' : [ 'JobID', 'TaskQueueID' ]
+                               }
+  # SiteMask table
+  _tablesDict[ 'SiteMask' ] = {
+                               'Fields' :
+                                         {
+                                          'Site'           : 'VARCHAR(64) NOT NULL',
+                                          'Status'         : 'VARCHAR(64) NOT NULL',
+                                          'LastUpdateTime' : 'DATETIME NOT NULL',
+                                          'Author'         : 'VARCHAR(255) NOT NULL',
+                                          'Comment'        : 'BLOB NOT NULL'
+                                         },
+                               'PrimaryKey' : [ 'Site' ]
+                              }
+  # SiteMaskLogging table
+  _tablesDict[ 'SiteMaskLogging' ] = {
+                                      'Fields' :
+                                                {
+                                                 'Site'       : 'VARCHAR(64) NOT NULL',
+                                                 'Status'     : 'VARCHAR(64) NOT NULL',
+                                                 'UpdateTime' : 'DATETIME NOT NULL',
+                                                 'Author'     : 'VARCHAR(255) NOT NULL',
+                                                 'Comment'    : 'BLOB NOT NULL'
+                                                }
+                                     }
+  # HeartBeatLoggingInfo table
+  _tablesDict[ 'HeartBeatLoggingInfo' ] = {
+                                           'Fields' :
+                                                     {
+                                                      'JobID'         : 'INTEGER NOT NULL',
+                                                      'Name'          : 'VARCHAR(100) NOT NULL',
+                                                      'Value'         : 'BLOB NOT NULL',
+                                                      'HeartBeatTime' : 'DATETIME NOT NULL'
+                                                     },
+                                           'Indexes' : { 'JobID' : [ 'JobID' ] }
+                                          }
+  # JobCommands table
+  _tablesDict[ 'JobCommands' ] = {
+                                  'Fields' :
+                                            {
+                                             'JobID'         : 'INTEGER NOT NULL',
+                                             'Command'       : 'VARCHAR(100) NOT NULL',
+                                             'Arguments'     : 'VARCHAR(100) NOT NULL',
+                                             'Status'        : 'VARCHAR(64) NOT NULL DEFAULT "Received"',
+                                             'ReceptionTime' : 'DATETIME NOT NULL',
+                                             'ExecutionTime' : 'DATETIME',
+                                            },
+                                  'Indexes' : { 'JobID' : [ 'JobID' ] }
+                                 }
+
 
   def __init__( self, maxQueueSize = 10 ):
     """ Standard Constructor
     """
 
-    DB.__init__( self, 'JobDB', 'WorkloadManagement/JobDB', maxQueueSize )
+    DB.__init__( self, 'JobDB', 'WorkloadManagement/JobDB', maxQueueSize, debug = DEBUG )
 
     self.maxRescheduling = gConfig.getValue( self.cs_path + '/MaxRescheduling', 3 )
 
@@ -108,21 +297,175 @@ class JobDB( DB ):
     if DEBUG:
       result = self.dumpParameters()
 
-  def _query( self, cmd, conn = False ):
-    start = time.time()
-    ret = DB._query( self, cmd, conn )
-    if DEBUG:
-      print >> gDebugFile, time.time() - start, cmd.replace( '\n', '' )
-      gDebugFile.flush()
-    return ret
+    self.__updateDBSchema()
 
-  def _update( self, cmd, conn = False ):
-    start = time.time()
-    ret = DB._update( self, cmd, conn )
-    if DEBUG:
-      print >> gDebugFile, time.time() - start, cmd.replace( '\n', '' )
-      gDebugFile.flush()
-    return ret
+
+  def _checkTable( self ):
+    """ _checkTable.
+
+    Method called on the MatcherHandler instead of on the JobDB constructor
+    to avoid an awful number of unnecessary queries with "show tables".
+    """
+
+    return self.__createTables()
+
+
+  def __createTables( self ):
+    """ __createTables
+
+    Writes the schema in the database. If a table is already in the schema, it is
+    skipped to avoid problems trying to create a table that already exists.
+    """
+
+    # Horrible SQL here !!
+    existingTables = self._query( "show tables" )
+    if not existingTables[ 'OK' ]:
+      return existingTables
+    existingTables = [ existingTable[0] for existingTable in existingTables[ 'Value' ] ]
+
+    # Makes a copy of the dictionary _tablesDict
+    tables = {}
+    tables.update( self._tablesDict )
+
+    for existingTable in existingTables:
+      if existingTable in tables:
+        del tables[ existingTable ]
+
+    res = self._createTables( tables )
+    if not res[ 'OK' ]:
+      return res
+
+    # Human readable S_OK message
+    if res[ 'Value' ] == 0:
+      res[ 'Value' ] = 'No tables created'
+    else:
+      res[ 'Value' ] = 'Tables created: %s' % ( ','.join( tables.keys() ) )
+    return res
+
+  def __updateDBSchema( self ):
+    result = self.__checkDBVersion()
+    if not result[ 'OK' ]:
+      self.log.error( "Can't retrieve schema version: %s" % result[ 'Message' ] )
+      return result
+    version = result[ 'Value' ]
+    while True:
+      self.log.info( "Current DB schema version %d" % version )
+      version += 1
+      try:
+        migration = getattr( self, '_JobDB__schemaMigration_%d' % version )
+        self.log.info( "Found schema migration" )
+      except AttributeError:
+        return S_OK( version )
+      with self.transaction as commit:
+        result = migration()
+        if not result[ 'OK' ]:
+          self.log.error( "Can't apply migration from schema version %d: %s" % ( version, result[ 'Message' ] ) )
+          return result
+        result = self._update( "INSERT INTO SchemaVersion VALUES ( %d )" % version )
+        if not result[ 'OK' ]:
+          self.log.error( "Error saving schema version %d: %s" % ( version, result[ 'Message' ] ) )
+          return result
+        commit()
+
+    return S_OK( version )
+
+  def __schemaMigration_0( self ):
+    self.log.info( "Updating MasterJobIDs..." )
+    #Set MasterJobID to the JobID if not set
+    result = self._update( "UPDATE `Jobs` SET MasterJobID = JobID WHERE MasterJobID = 0" )
+    if not result[ 'OK' ]:
+      return result
+    #Alter JobSplitType to HerdState
+    result = self._query( "DESCRIBE Jobs" )
+    if not result[ 'OK' ]:
+      return result
+    cols = result[ 'Value' ]
+    found = False
+    for col in cols:
+      if col[0] == 'JobSplitType':
+        result = self._update( "ALTER TABLE Jobs CHANGE JobSplitType HerdState ENUM ('Single','WillSplit','Splitted') NOT NULL DEFAULT 'Single'" )
+        if not result[ 'OK' ]:
+          return result
+    #Get current tables
+    result = self._query( "SHOW TABLES" )
+    if not result[ 'OK' ]:
+      return result
+    tablesInDB = [ t[0] for t in result[ 'Value' ] ]
+    #Create required tables
+    tables = { 'SchemaVersion' : { 'Fields' : { 'Version' : 'INTEGER UNSIGNED' } } }
+    tables[ 'LFN' ] = { 'Fields' : { 'LFNID' : 'INTEGER NOT NULL AUTO_INCREMENT',
+                                     'JobID' : 'INTEGER UNSIGNED NOT NULL',
+                                     'LFN' : 'VARCHAR(512) NOT NULL' ,
+                                     'Checksum' : 'VARCHAR(64) DEFAULT ""',
+                                     'CreationDate' : 'DATETIME',
+                                     'ModificationDate' : 'DATETIME',
+                                     'Size' : 'INTEGER UNSIGNED DEFAULT 0' },
+                        'PrimaryKey' : 'LFNID',
+                        'UniqueIndexes' : { 'joblfn' : [ 'JobID', 'LFN' ] } }
+    tables[ 'Replicas' ] = { 'Fields' : { 'LFNID' : 'INTEGER NOT NULL',
+                                          'SEName' : 'VARCHAR(64) NOT NULL',
+                                          'SURL' : 'VARCHAR(256) NOT NULL',
+                                          'Disk' : 'TINYINT(1) NOT NULL' },
+                             'PrimaryKey' : [ 'LFNID', 'SEName', 'SURL' ],
+                             'Indexes' : { 'LFNID' : [ 'LFNID' ] },
+                             'ForeignKeys' : { 'LFNID' : 'LFN' } }
+    tables[ 'MasterJDLs' ] = { 'Fields' : { 'JobID' : 'int(11) NOT NULL',
+                                            'JDL' : 'BLOB NOT NULL' },
+                             'PrimaryKey' : [ 'JobID' ] }
+
+    for t in tablesInDB:
+      try:
+        tables.pop( t )
+      except KeyError:
+        pass
+    result = self._createTables( tables )
+    if not result[ 'OK' ]:
+      return result
+    #Create foreign keys
+
+    #Drop old tables
+    dropTables = []
+    for t in [ 'SubJobs', 'PrecursorJobs', 'TaskQueues', 'TaskQueue', 'InputData' ]:
+      if t in tablesInDB:
+        dropTables.append( t )
+
+    if dropTables:
+      self.log.info( "Info dropping tables %s" % ", ".join( dropTables ) )
+
+      result = self._update( "DROP TABLE %s" % ", ".join( dropTables ) )
+      if not result[ 'OK' ]:
+        return result
+
+    #Migrate to innodb
+    result = self._query( "SHOW TABLE STATUS" )
+    if not result[ 'OK' ]:
+      return result
+    tableStatus = dict( [ ( r[0], r[1] ) for r in result[ 'Value' ] ] )
+    for tableName in tableStatus:
+      if tableStatus[ tableName ] == "MyISAM":
+        self.log.info( "Migrating table %s to innodb" % tableName )
+        result = self._update( "ALTER TABLE `%s` ENGINE = INNODB" % tableName )
+        if not result[ 'OK' ]:
+          self.log.error( "Error migrating %s to innodb: %s" % ( tableName, result[ 'Message' ] ) )
+    return S_OK()
+
+
+
+  def __checkDBVersion( self ):
+    result = self._query( "show tables" )
+    if not result[ 'OK' ]:
+      return result
+    tables = [ r[0] for r in result[ 'Value' ] ]
+    if 'SchemaVersion' not in tables:
+      return S_OK( -1 )
+    result = self._query( "SELECT MAX(Version) FROM SchemaVersion" )
+    if not result[ 'OK' ]:
+      return result
+    version = result[ 'Value' ][0][0]
+    if version == None:
+      version = -1
+    return S_OK( version )
+
 
   def dumpParameters( self ):
     """  Dump the JobDB connection parameters to the stdout
@@ -150,77 +493,13 @@ class JobDB( DB ):
       return res
 
     self.jobAttributeNames = []
-    for field, fieldtype, null, key, default, extra in res['Value']:
+    for row in res['Value']:
+      field = row[0]
       self.jobAttributeNames.append( field )
 
     self.nJobAttributeNames = len( self.jobAttributeNames )
 
     return S_OK()
-
-  def __buildCondition( self, condDict, older = None, newer = None, timeStamp = 'LastUpdateTime' ):
-    """ build SQL condition statement from provided condDict
-        and other extra conditions
-    """
-    condition = ''
-    conjunction = "WHERE"
-
-    if condDict != None:
-      for attrName, attrValue in condDict.items():
-        ret = self._escapeString( attrName )
-        if not ret['OK']:
-          return ret
-        attrName = "`" + ret['Value'][1:-1] + "`"
-
-        if type( attrValue ) == types.ListType:
-          multiValueList = []
-          for x in attrValue:
-            ret = self._escapeString( x )
-            if not ret['OK']:
-              return ret
-            x = ret['Value']
-            multiValueList.append( x )
-          multiValue = ','.join( multiValueList )
-          condition = ' %s %s %s in (%s)' % ( condition,
-                                             conjunction,
-                                             attrName,
-                                             multiValue )
-        else:
-          ret = self._escapeString( attrValue )
-          if not ret['OK']:
-            return ret
-          attrValue = ret['Value']
-
-          condition = ' %s %s %s=%s' % ( condition,
-                                         conjunction,
-                                         attrName,
-                                         attrValue )
-        conjunction = "AND"
-
-    if older:
-      ret = self._escapeString( older )
-      if not ret['OK']:
-        return ret
-      older = ret['Value']
-
-      condition = ' %s %s %s < %s' % ( condition,
-                                       conjunction,
-                                       timeStamp,
-                                       older )
-      conjunction = "AND"
-
-    if newer:
-      ret = self._escapeString( newer )
-      if not ret['OK']:
-        return ret
-      newer = ret['Value']
-
-      condition = ' %s %s %s >= %s' % ( condition,
-                                        conjunction,
-                                        timeStamp,
-                                        newer )
-
-    return condition
-
 
 #############################################################################
   def getJobID( self ):
@@ -230,30 +509,15 @@ class JobDB( DB ):
     cmd = 'INSERT INTO Jobs (SubmissionTime) VALUES (UTC_TIMESTAMP())'
     err = 'JobDB.getJobID: Failed to retrieve a new Id.'
 
-    res = self._getConnection()
+    res = self._update( cmd )
     if not res['OK']:
-      return S_ERROR( '0 %s\n%s' % ( err, res['Message'] ) )
-
-    connection = res['Value']
-    res = self._update( cmd, connection )
-    if not res['OK']:
-      connection.close()
       return S_ERROR( '1 %s\n%s' % ( err, res['Message'] ) )
 
-    cmd = 'SELECT LAST_INSERT_ID()'
-    res = self._query( cmd, connection )
-    if not res['OK']:
-      connection.close()
-      return S_ERROR( '2 %s\n%s' % ( err, res['Message'] ) )
+    if not 'lastRowId' in res['Value']:
+      return S_ERROR( '2 %s' % err )
 
-    try:
-      connection.close()
-      jobID = int( res['Value'][0][0] )
-      self.log.info( 'JobDB: New JobID served "%s"' % jobID )
-    except Exception, x:
-      return S_ERROR( '3 %s\n%s' % ( err, str( x ) ) )
-
-    return S_OK( jobID )
+    jobID = int( res['Value']['lastRowId'] )
+    self.log.info( 'JobDB: New JobID served "%s"' % jobID )
 
 #############################################################################
   def getAttributesForJobList( self, jobIDList, attrList = None ):
@@ -300,16 +564,113 @@ class JobDB( DB ):
                                 newer = None, timeStamp = 'LastUpdateTime' ):
     """ Get distinct values of the job attribute under specified conditions
     """
-    cmd = 'SELECT  DISTINCT(%s) FROM Jobs ORDER BY %s' % ( attribute, attribute )
+    return self.getDistinctAttributeValues( 'Jobs', attribute, condDict = condDict,
+                                              older = older, newer = newer, timeStamp = timeStamp )
 
-    cond = self.__buildCondition( condDict, older = older, newer = newer, timeStamp = timeStamp )
 
-    result = self._query( cmd + cond )
+#############################################################################
+  def traceJobParameter( self, site, localID, parameter, date = None, until = None ):
+    ret = self.traceJobParameters( site, localID, [parameter], None, date, until )
+    if not ret['OK']:
+      return ret
+    returnDict = {}
+    for jobID in ret['Value']:
+      returnDict[jobID] = ret['Value'][jobID].get( parameter )
+    return S_OK( returnDict )
+
+#############################################################################
+  def traceJobParameters( self, site, localIDs, paramList = None, attributeList = None, date = None, until = None ):
+    import datetime
+    exactTime = False
+    if not attributeList:
+      attributeList = []
+    attributeList = list( set( attributeList ) | set( ['StartExecTime', 'SubmissionTime', 'HeartBeatTime',
+                                                    'EndExecTime', 'JobName', 'OwnerDN', 'OwnerGroup'] ) )
+    try:
+      if type( localIDs ) == type( [] ) or type( localIDs ) == type( {} ):
+        localIDs = [int( localID ) for localID in localIDs]
+      else:
+        localIDs = [int( localIDs )]
+    except:
+      return S_ERROR( "localIDs must be integers" )
+    now = datetime.datetime.utcnow()
+    if until:
+      if until.lower() == 'now':
+        until = now
+      else:
+        try:
+          until = datetime.datetime.strptime( until, '%Y-%m-%d' )
+        except:
+          return S_ERROR( "Error in format for 'until', expected '%Y-%m-%d'" )
+    if not date:
+      until = now
+      since = until - datetime.timedelta( hours = 24 )
+    else:
+      since = None
+      for format in ( '%Y-%m-%d', '%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S' ):
+        try:
+          since = datetime.datetime.strptime( date, format )
+          break
+        except:
+          exactTime = True
+      if not since:
+        return S_ERROR( 'Error in date format' )
+      if exactTime:
+        exactTime = since
+        if not until:
+          until = now
+      else:
+        if not until:
+          until = since + datetime.timedelta( hours = 24 )
+      if since > now:
+        return S_ERROR( 'Cannot find jobs in the future' )
+      if until > now:
+        until = now
+    result = self.selectJobs( {'Site':site}, older = str( until ), newer = str( since ) )
     if not result['OK']:
       return result
-
-    attr_list = [ x[0] for x in result['Value'] ]
-    return S_OK( attr_list )
+    if not result['Value']:
+      return S_ERROR( 'No jobs found at %s for date %s' % ( site, date ) )
+    resultDict = {'Successful':{}, 'Failed':{}}
+    for jobID in result['Value']:
+      if jobID:
+        ret = self.getJobParameter( jobID, 'LocalJobID' )
+        if not ret['OK']:
+          return ret
+        localID = ret['Value']
+        if localID and int( localID ) in localIDs:
+          attributes = self.getJobAttributes( jobID, attributeList )
+          if not attributes['OK']:
+            return attributes
+          attributes = attributes['Value']
+          if exactTime:
+            for att in ( 'StartExecTime', 'SubmissionTime' ):
+              startTime = attributes.get( att )
+              if startTime == 'None':
+                startTime = None
+              if startTime:
+                break
+            startTime = datetime.datetime.strptime( startTime , '%Y-%m-%d %H:%M:%S' ) if startTime else now
+            for att in ( 'EndExecTime', 'HeartBeatTime' ):
+              lastTime = attributes.get( att )
+              if lastTime == 'None':
+                lastTime = None
+              if lastTime:
+                break
+            lastTime = datetime.datetime.strptime( lastTime, '%Y-%m-%d %H:%M:%S' ) if lastTime else now
+            okTime = ( exactTime >= startTime and exactTime <= lastTime )
+          else:
+            okTime = True
+          if okTime:
+            ret = self.getJobParameters( jobID, paramList = paramList )
+            if not ret['OK']:
+              return ret
+            attributes.update( ret['Value'] )
+            resultDict['Successful'].setdefault( int( localID ), {} )[int( jobID )] = attributes
+    for localID in localIDs:
+      if localID not in resultDict['Successful']:
+        resultDict['Failed'][localID] = 'localID not found'
+    return S_OK( resultDict )
 
 #############################################################################
   def getJobParameters( self, jobID, paramList = None ):
@@ -349,7 +710,7 @@ class JobDB( DB ):
         return S_ERROR( 'JobDB.getJobParameters: failed to retrieve parameters' )
 
     else:
-      result = self._getFields( 'JobParameters', ['Name', 'Value'], ['JobID'], [jobID] )
+      result = self.getFields( 'JobParameters', ['Name', 'Value'], {'JobID': jobID} )
       if not result['OK']:
         return result
       else:
@@ -413,51 +774,19 @@ class JobDB( DB ):
         Return a dictionary with all Job Attributes,
         return an empty dictionary if matching job found
     """
-
-    ret = self._escapeString( jobID )
-    if not ret['OK']:
-      return ret
-    jobID = ret['Value']
-
-    if attrList:
-      attrNameList = []
-      for x in attrList:
-        ret = self._escapeString( x )
-        if not ret['OK']:
-          return ret
-        x = "`" + ret['Value'][1:-1] + "`"
-        attrNameList.append( x )
-      attrNames = ','.join( attrNameList )
-    else:
-      attrNameList = []
-      for x in self.jobAttributeNames:
-        ret = self._escapeString( x )
-        if not ret['OK']:
-          return ret
-        x = "`" + ret['Value'][1:-1] + "`"
-        attrNameList.append( x )
-      attrNames = ','.join( attrNameList )
-    self.log.debug( 'JobDB.getAllJobAttributes: Getting Attributes for job = %s.' % jobID )
-
-    cmd = 'SELECT %s FROM Jobs WHERE JobID=%s' % ( attrNames, jobID )
-    res = self._query( cmd )
-    if not res['OK']:
-      return res
-
-    if len( res['Value'] ) == 0:
-      return S_OK ( {} )
-
-    values = res['Value'][0]
-
-    attributes = {}
-    if attrList:
-      for i in range( len( attrList ) ):
-        attributes[attrList[i]] = str( values[i] )
-    else:
-      for i in range( len( self.jobAttributeNames ) ):
-        attributes[self.jobAttributeNames[i]] = str( values[i] )
-
-    return S_OK( attributes )
+    if not attrList:
+      attrList = self.jobAttributeNames
+    result = self.getFields( "Jobs", outFields = attrList, condDict = { 'JobID' : jobID } )
+    if not result[ 'OK' ]:
+      return result
+    dbData = result[ 'Value' ]
+    if not dbData:
+      return S_OK( {} )
+    jobData = dbData[0]
+    ret = {}
+    for iP in range( len( attrList ) ):
+      ret[ attrList[iP] ] = jobData[ iP ]
+    return S_OK( ret )
 
 #############################################################################
   def getJobInfo( self, jobID, parameters = None ):
@@ -529,21 +858,16 @@ class JobDB( DB ):
     """
 
     result = self.getJobParameters( jobID, [parameter] )
-    if result['OK']:
-      if result['Value']:
-        value = result['Value'][parameter]
-      else:
-        value = None
-      return S_OK( value )
-    else:
+    if not result['OK']:
       return result
+    return S_OK( result.get( 'Value', {} ).get( parameter ) )
 
 #############################################################################
   def getJobOptParameter( self, jobID, parameter ):
     """ Get optimizer parameters for the given job.
     """
 
-    result = self._getFields( 'OptimizerParameters', ['Value'], ['JobID', 'Name'], [jobID, parameter] )
+    result = self.getFields( 'OptimizerParameters', ['Value'], {'JobID': jobID, 'Name': parameter} )
     if result['OK']:
       if result['Value']:
         return S_OK( result['Value'][0][0] )
@@ -552,7 +876,7 @@ class JobDB( DB ):
     else:
       return S_ERROR( 'Failed to access database' )
 
- #############################################################################
+#############################################################################
   def getJobOptParameters( self, jobID, paramList = None ):
     """ Get optimizer parameters for the given job. If the list of parameter names is
         empty, get all the parameters then
@@ -613,7 +937,6 @@ class JobDB( DB ):
     if not cpu:
       cpu = 0.0
 
-    wctime = 0.0
     req = "SELECT SUM(Value) from JobParameters WHERE Name='WallClockTime(s)' and JobID in (%s)" % jobString
     result = self._query( req )
     if not result['OK']:
@@ -625,47 +948,98 @@ class JobDB( DB ):
     return S_OK( {"CPUTime":int( cpu ), "WallClockTime":int( wctime )} )
 
 #############################################################################
-  def getInputData ( self, jobID ):
-    """Get input data for the given job
-    """
-    ret = self._escapeString( jobID )
-    if not ret['OK']:
-      return ret
-    jobID = ret['Value']
-    cmd = 'SELECT LFN FROM InputData WHERE JobID=%s' % jobID
-    res = self._query( cmd )
-    if not res['OK']:
-      return res
-
-    return S_OK( [ self._to_value( i ) for i in  res['Value'] ] )
+  def __checkInputDataStructure( self, pDict ):
+    if type( pDict ) != types.DictType:
+      return S_ERROR( "Input data has to be a dictionary" )
+    for lfn in pDict:
+      if 'Metadata' not in pDict[ lfn ]:
+        return S_ERROR( "Missing metadata for lfn %s" % lfn )
+      if 'Replicas' not in pDict[ lfn ]:
+        return S_ERROR( "Missing replicas for lfn %s" % lfn )
+        replicas = pDict[ lfn ][ 'Replicas' ]
+        for seName in replicas:
+          if 'SURL' not in replicas or 'Disk' not in replicas:
+            return S_ERROR( "Missing SURL or Disk for %s:%s replica" % ( seName, lfn ) )
+    return S_OK()
 
 #############################################################################
-  def setInputData ( self, jobID, inputData ):
-    """Inserts input data for the given job
+  def getInputData ( self, jid ):
+    """Get input data for the given job
     """
-    ret = self._escapeString( jobID )
-    if not ret['OK']:
-      return ret
-    jobID = ret['Value']
-    cmd = 'DELETE FROM InputData WHERE JobID=%s' % ( jobID )
+    try:
+      jid = int( jid )
+    except ValueError:
+      return S_ERROR( "Job id needs to be an integer" )
+    result = self._query( "SELECT l.LFN, l.Checksum, l.CreationDate, l.ModificationDate, l.Size, r.SURL, r.SEName, r.Disk FROM LFN l, Replicas r WHERE l.JobID = %d AND l.LFNID = r.LFNID" % jid )
+    if not result[ 'OK' ]:
+      return result
+    data = {}
+    for lfn, checksum, creationDate, modifDate, size, surl, SEName, onDisk in result[ 'Value' ]:
+      if lfn not in data:
+        data[ lfn ] = { 'Metadata' : { 'Checksum' : checksum, 'CreationDate' : creationDate,
+                                       'ModificationDate' : modifDate, 'Size' : size },
+                        'Replicas' : {} }
+      rD = data[ lfn ][ 'Replicas' ]
+      rD[ SEName ] = { 'SURL' : surl, 'Disk' : onDisk }
+    return S_OK( data )
+
+#############################################################################
+
+  def __cleanInputData( self, jid ):
+    cmd = "DELETE FROM Replicas WHERE LFNID IN ( SELECT LFNID FROM LFN WHERE JobID = %d )" % jid
     result = self._update( cmd )
     if not result['OK']:
-      result = S_ERROR( 'JobDB.setInputData: operation failed.' )
+      return S_ERROR( "Could not clean input data for job %d: %s" % ( jid, result[ 'Message' ] ) )
+    cmd = "DELETE FROM LFN WHERE JobID = %d" % jid
+    result = self._update( cmd )
+    if not result['OK']:
+      return S_ERROR( "Could not clean input data for job %d: %s" % ( jid, result[ 'Message' ] ) )
+    return S_OK()
 
-    for lfn in inputData:
-      # some jobs are setting empty string as InputData
-      if not lfn:
-        continue
-      ret = self._escapeString( lfn.strip() )
-      if not ret['OK']:
-        return ret
-      lfn = ret['Value']
-      cmd = 'INSERT INTO InputData (JobID,LFN) VALUES (%s, %s )' % ( jobID, lfn )
-      res = self._update( cmd )
-      if not res['OK']:
-        return res
+#############################################################################
+  def setInputData ( self, jid, lfnData ):
+    """Inserts input data for the given job
+    """
+    try:
+      jid = int( jid )
+    except ValueError:
+      return S_ERROR( "Job id needs to be an integer" )
+    result = self.__checkInputDataStructure( lfnData )
+    if not result['OK']:
+      return result
+    result = self.__cleanInputData( jid )
+    if not result['OK']:
+      return S_ERROR( "Could not clean input data for job %d: %s" % ( jid, result[ 'Message' ] ) )
+    for lfn in lfnData:
+      vD = { 'JobID' : jid, 'LFN' : lfn }
+      metaDict = lfnData[ lfn ][ 'Metadata' ]
+      for k in ( 'Checksum', 'CreationDate', 'ModificationDate', 'Size' ):
+        if k in metaDict:
+          vD[ k ] = metaDict[ k ]
+      result = self.insertFields( "LFN", inDict = vD )
+      if not result[ 'OK' ]:
+        return S_ERROR( "Can not insert input data: %s" % result[ 'Message' ] )
+      lfnid = result[ 'lastRowId' ]
+      vL = []
+      replicas = lfnData[ lfn ][ 'Replicas' ]
+      for seName in replicas:
+        result = self._escapeString( replicas[ seName ][ 'SURL' ] )
+        if not result[ 'OK' ]:
+          return result
+        surl = result[ 'Value' ]
+        disk = int( replicas[ seName ][ 'Disk' ] )
+        result = self._escapeString( seName )
+        if not result[ 'OK' ]:
+          return result
+        seName = result[ 'Value' ]
+        vL.append( "%d, %s, %s, %d" % ( lfnid, seName, surl, disk ) )
+      values = "),(".join( vL )
+      cmd = "INSERT INTO Replicas ( LFNID, SEName, SURL, Disk ) VALUES ( %s )" % values
+      result = self._update( cmd )
+      if not result[ 'OK' ]:
+        return S_ERROR( "Can not insert input data: %s" % result[ 'Message' ] )
 
-    return S_OK( 'Files added' )
+    return S_OK()
 
 #############################################################################
   def setOptimizerChain( self, jobID, optimizerList ):
@@ -678,7 +1052,7 @@ class JobDB( DB ):
     result = self.setJobOptParameter( jobID, 'OptimizerChain', optString )
     return result
 
- #############################################################################
+#############################################################################
   def setNextOptimizer( self, jobID, currentOptimizer ):
     """ Set the job status to be processed by the next optimizer in the
         chain
@@ -715,12 +1089,7 @@ class JobDB( DB ):
     """ Get the number of jobs matching conditions specified by condDict and time limits
     """
     self.log.debug ( 'JobDB.countJobs: counting Jobs' )
-    cond = self.__buildCondition( condDict, older, newer, timeStamp )
-    cmd = ' SELECT count(JobID) from Jobs '
-    ret = self._query( cmd + cond )
-    if ret['OK']:
-      return S_OK( ret['Value'][0][0] )
-    return ret
+    return self.countEntries( 'Jobs', condDict, older = older, newer = newer, timeStamp = timeStamp )
 
 #############################################################################
   def selectJobs( self, condDict, older = None, newer = None, timeStamp = 'LastUpdateTime',
@@ -735,23 +1104,9 @@ class JobDB( DB ):
 
     self.log.debug( 'JobDB.selectJobs: retrieving jobs.' )
 
-    condition = self.__buildCondition( condDict, older, newer, timeStamp )
+    res = self.getFields( 'Jobs', ['JobID'], condDict = condDict, limit = limit,
+                            older = older, newer = newer, timeStamp = timeStamp, orderAttribute = orderAttribute )
 
-    if orderAttribute:
-      orderType = None
-      orderField = orderAttribute
-      if orderAttribute.find( ':' ) != -1:
-        orderType = orderAttribute.split( ':' )[1].upper()
-        orderField = orderAttribute.split( ':' )[0]
-      condition = condition + ' ORDER BY ' + orderField
-      if orderType:
-        condition = condition + ' ' + orderType
-
-    if limit:
-      condition = condition + ' LIMIT ' + str( limit )
-
-    cmd = 'SELECT JobID from Jobs ' + condition
-    res = self._query( cmd )
     if not res['OK']:
       return res
 
@@ -782,7 +1137,7 @@ class JobDB( DB ):
       return ret
     value = ret['Value']
 
-    #FIXME: need to check the validity of attrName
+    # FIXME: need to check the validity of attrName
 
     if update:
       cmd = "UPDATE Jobs SET %s=%s,LastUpdateTime=UTC_TIMESTAMP() WHERE JobID=%s" % ( attrName, value, jobID )
@@ -888,7 +1243,7 @@ class JobDB( DB ):
     result = self._update( req )
     return result
 
- #############################################################################
+#############################################################################
   def setStartExecTime( self, jobID, startDate = None ):
     """ Set StartExecTime time stamp
     """
@@ -910,30 +1265,6 @@ class JobDB( DB ):
     return result
 
 #############################################################################
-  def setJobParameter_old( self, jobID, key, value ):
-    """ Set a parameter specified by name,value pair for the job JobID
-    """
-    ret = self._escapeString( jobID )
-    if not ret['OK']:
-      return ret
-    e_jobID = ret['Value']
-
-    ret = self._escapeString( key )
-    if not ret['OK']:
-      return ret
-    e_key = ret['Value']
-
-    cmd = 'DELETE FROM JobParameters WHERE JobID=%s AND Name=%s' % ( e_jobID, e_key )
-    if not self._update( cmd )['OK']:
-      result = S_ERROR( 'JobDB.setJobParameter: operation failed.' )
-
-    result = self._insert( 'JobParameters', ['JobID', 'Name', 'Value'], [jobID, key, value] )
-    if not result['OK']:
-      result = S_ERROR( 'JobDB.setJobParameter: operation failed.' )
-
-    return result
-
-#############################################################################
   def setJobParameter( self, jobID, key, value ):
     """ Set a parameter specified by name,value pair for the job JobID
     """
@@ -951,45 +1282,6 @@ class JobDB( DB ):
     result = self._update( cmd )
     if not result['OK']:
       result = S_ERROR( 'JobDB.setJobParameter: operation failed.' )
-
-    return result
-
-#############################################################################
-  def setJobParameters_old( self, jobID, parameters ):
-    """ Set parameters specified by a list of name/value pairs for the job JobID
-    """
-
-    ret = self._escapeString( jobID )
-    if not ret['OK']:
-      return ret
-    jobID = ret['Value']
-
-    if not parameters:
-      return S_OK()
-
-    deleteCondList = []
-    insertValueList = []
-    for name, value in parameters:
-      ret = self._escapeString( name )
-      if not ret['OK']:
-        return ret
-      name = ret['Value']
-      ret = self._escapeString( value )
-      if not ret['OK']:
-        return ret
-      value = ret['Value']
-      deleteCondList.append( '(JobID=%s AND Name=%s)' % ( jobID, name ) )
-      insertValueList.append( '(%s,%s,%s)' % ( jobID, name, value ) )
-
-    cmd = 'DELETE FROM JobParameters WHERE %s ' % ' OR '.join( deleteCondList )
-    if not self._update( cmd )['OK']:
-      result = S_ERROR( 'JobDB.setJobParameters: operation failed.' )
-
-    cmd = 'INSERT INTO JobParameters (JobID,Name,Value) VALUES %s' % ', '.join( insertValueList )
-
-    result = self._update( cmd )
-    if not result['OK']:
-      return S_ERROR( 'JobDB.setJobParameters: operation failed.' )
 
     return result
 
@@ -1020,7 +1312,7 @@ class JobDB( DB ):
 
     return result
 
- #############################################################################
+#############################################################################
   def setJobOptParameter( self, jobID, name, value ):
     """ Set an optimzer parameter specified by name,value pair for the job JobID
     """
@@ -1038,7 +1330,7 @@ class JobDB( DB ):
     if not self._update( cmd )['OK']:
       result = S_ERROR( 'JobDB.setJobOptParameter: operation failed.' )
 
-    result = self._insert( 'OptimizerParameters', ['JobID', 'Name', 'Value'], [jobID, name, value] )
+    result = self.insertFields( 'OptimizerParameters', ['JobID', 'Name', 'Value'], [jobID, name, value] )
     if not result['OK']:
       return S_ERROR( 'JobDB.setJobOptParameter: operation failed.' )
 
@@ -1062,6 +1354,41 @@ class JobDB( DB ):
       return S_ERROR( 'JobDB.removeJobOptParameter: operation failed.' )
     else:
       return S_OK()
+
+#############################################################################
+  def clearAtticParameters( self, jid ):
+    try:
+      jid = int( jid )
+    except ValueError:
+      return S_ERROR( "jid has to be a number" )
+    return self._update( "DELETE FROM AtticJobParameters WHERE JobID=%s" % jid )
+
+#############################################################################
+  def setAtticParameters( self, jid, rescheduleCounter, paramsDict ):
+    if not paramsDict:
+      return S_OK()
+
+    try:
+      jid = int( jid )
+      rescheduleCounter = int( rescheduleCounter )
+    except ValueError:
+      return S_ERROR( "Invalud jid/reschedulecounter. Not a number" )
+
+    entries = []
+    for key in paramsDict:
+      ret = self._escapeString( paramsDict[ key ] )
+      if not ret['OK']:
+        return ret
+      value = ret['Value']
+
+      ret = self._escapeString( key )
+      if not ret['OK']:
+        return ret
+      key = ret['Value']
+
+      entries.append( "(%d,%d,%s,%s)" % ( jid, rescheduleCounter, key, value, ) )
+
+    return self._update( "INSERT INTO AtticJobParameters VALUES %s" % ",".join( entries ) )
 
 #############################################################################
   def setAtticJobParameter( self, jobID, key, value, rescheduleCounter ):
@@ -1088,29 +1415,13 @@ class JobDB( DB ):
       return ret
     rescheduleCounter = ret['Value']
 
-    cmd = 'INSERT INTO AtticJobParameters VALUES(%s,%s,%s,%s)' % \
+    cmd = 'INSERT INTO AtticJobParameters (JobID,RescheduleCycle,Name,Value) VALUES(%s,%s,%s,%s)' % \
          ( jobID, rescheduleCounter, key, value )
     result = self._update( cmd )
     if not result['OK']:
       result = S_ERROR( 'JobDB.setAtticJobParameter: operation failed.' )
 
     return result
-
-#############################################################################
-  def __setInitialJobParameters( self, classadJob, jobID ):
-    """ Set initial job parameters as was defined in the Classad
-    """
-
-    # Extract initital job parameters
-    parameters = {}
-    if classadJob.lookupAttribute( "Parameters" ):
-      parameters = classadJob.getDictionaryFromSubJDL( "Parameters" )
-    res = self.setJobParameters( jobID, parameters.items() )
-
-    if not res['OK']:
-      return res
-
-    return S_OK()
 
 #############################################################################
   def setJobJDL( self, jobID, jdl = None, originalJDL = None ):
@@ -1161,28 +1472,16 @@ class JobDB( DB ):
   def __insertNewJDL( self, jdl ):
     """Insert a new JDL in the system, this produces a new JobID
     """
-    res = self._getConnection()
-    if not res['OK']:
-      return res
-    connection = res['Value']
-    res = self._insert( 'JobJDLs' , ['OriginalJDL'], [jdl], connection )
 
-    cmd = 'SELECT LAST_INSERT_ID()'
-    res = self._query( cmd, connection )
-    if not res['OK']:
-      connection.close()
-      self.log.error( 'Can not retrieve LAST_INSERT_ID', res['Message'] )
-      return res
+    err = 'JobDB.__insertNewJDL: Failed to retrieve a new Id.'
 
-    try:
-      connection.close()
-      jobID = int( res['Value'][0][0] )
-      self.log.info( 'JobDB: New JobID served "%s"' % jobID )
-    except Exception, x:
-      self.log.exception( 'Exception retrieving LAST_INSERT_ID' )
-      return S_ERROR( "Can not retrieve LAST_INSERT_ID: %s" % str( x ) )
+    result = self.insertFields( 'JobJDLs' , ['OriginalJDL'], [jdl] )
+    if not result['OK']:
+      self.log.error( 'Can not insert New JDL', result['Message'] )
+      return result
 
-    return S_OK( jobID )
+    jid = result[ 'lastRowId' ]
+    return S_OK( jid )
 
 
 #############################################################################
@@ -1219,26 +1518,115 @@ class JobDB( DB ):
     else:
       return result
 
+
+  def getJobsInHerd( self, jid ):
+    try:
+      jid = int( jid )
+    except ValueError:
+      return S_ERROR( "jid has to be a number" % jid )
+    result = self._query( "SELECT JobID FROM Jobs WHERE MasterJobID=%d" % jid )
+    if not result[ 'OK' ]:
+      return result
+    return S_OK( [ row[0] for row in result[ 'Value' ] ] )
+
+  def insertSplittedManifests( self, jid, manifests ):
+    jidList = [ jid ]
+    with self.transaction as commit:
+      result = self.getJobJDL( jid, original = True )
+      if not result[ 'OK' ]:
+        return result
+      sourceManifest = result[ 'Value' ]
+      result = self.insertFields( 'MasterJDLs', inDict = { 'JobID' : jid,
+                                                           'JDL' : sourceManifest } )
+      if not result[ 'OK' ]:
+        return result
+      jobManifest = manifests[0]
+      manifestJDL = jobManifest.dumpAsJDL()
+      result = self.updateFields( 'JobJDLs',
+                                  condDict = { 'JobID' : jid },
+                                  updateDict = { 'JDL' : manifestJDL,
+                                                 'OriginalJDL' : manifestJDL,
+                                                 'JobRequirements' : '' } )
+      if not result[ 'OK' ]:
+        return result
+
+      #Get source job input data
+      result = self.getInputData( jid )
+      if not result[ 'OK' ]:
+        return result
+      sourceInputData = result[ 'Value' ]
+
+      #Reset source Job Values
+      upDict = { 'Status' : 'Received',
+                 'MinorStatus' : 'Job accepted',
+                 'ApplicationStatus' : 'Unknown',
+                 'HerdState' : 'Splitted' }
+      for name in ( 'JobName', 'JobType', 'JobGroup', 'Priority' ):
+        value = jobManifest.getOption( name )
+        if name == 'Priority':
+          name = 'UserPriority'
+        if value:
+          upDict[ name ] = value
+      result = self.updateFields( 'Jobs',
+                                  condDict = { 'JobID' : jid },
+                                  updateDict = upDict )
+      if not result[ 'OK' ]:
+        return result
+
+      #Reduce source job input data
+      if sourceInputData:
+        inputData = {}
+        for lfn in jobManifest.getOption( "InputData", [] ):
+          if lfn not in sourceInputData:
+            return S_ERROR( "LFN in splitted manifest does not exist in the original: %s" % lfn )
+        inputData[ lfn ] = dict( sourceInputData[ lfn ] )
+        result = self.setInputData( jid, inputData )
+        if not result[ 'OK' ]:
+          return result
+
+      #Get job attributes to copy them to children jobs
+      result = self.getJobAttributes( jid, [ 'Owner', 'OwnerDN', 'OwnerGroup', 'DIRACSetup' ] )
+      if not result[ 'OK' ]:
+        return result
+      attrs = result[ 'Value' ]
+
+      #Do the magic!
+      for manifest in manifests[1:]:
+        result = self.insertNewJobIntoDB( manifest.dumpAsJDL(), attrs[ 'Owner' ], attrs[ 'OwnerDN' ],
+                                          attrs[ 'OwnerGroup' ], attrs[ 'DIRACSetup' ], jid )
+        if not result[ 'OK' ]:
+          return result
+        jidList.append( result[ 'Value' ] )
+        if sourceInputData:
+          inputData = {}
+          for lfn in manifest.getOption( "InputData", [] ):
+            if lfn not in sourceInputData:
+              return S_ERROR( "LFN in splitted manifest does not exist in the original: %s" % lfn )
+          inputData[ lfn ] = dict( sourceInputData[ lfn ] )
+          result = self.setInputData( jidList[-1], inputData )
+          if not result[ 'OK' ]:
+            return result
+      commit()
+
+    return S_OK( jidList )
+
 #############################################################################
-  def insertNewJobIntoDB( self, jdl, owner, ownerDN, ownerGroup, diracSetup ):
+  def insertNewJobIntoDB( self, jdl, owner, ownerDN, ownerGroup, diracSetup, parentJob = None ):
     """ Insert the initial JDL into the Job database,
         Do initial JDL crosscheck,
         Set Initial job Attributes and Status
     """
-
-    jDesc = JobDescription()
-    result = jDesc.loadDescription( jdl )
+    jobManifest = JobManifest()
+    result = jobManifest.load( jdl )
     if not result['OK']:
       return result
-    jDesc.setVarsFromDict( { 'OwnerName' : owner,
-                             'OwnerDN' : ownerDN,
-                             'OwnerGroup' : ownerGroup,
-                             'DIRACSetup' : diracSetup } )
-    result = jDesc.checkDescription()
+    jobManifest.setOptionsFromDict( { 'OwnerName' : owner,
+                                      'OwnerDN' : ownerDN,
+                                      'OwnerGroup' : ownerGroup,
+                                      'DIRACSetup' : diracSetup } )
+    result = jobManifest.check()
     if not result['OK']:
       return result
-    jobAttrNames = []
-    jobAttrValues = []
 
     # 1.- insert original JDL on DB and get new JobID
     # Fix the possible lack of the brackets in the JDL
@@ -1246,235 +1634,97 @@ class JobDB( DB ):
       jdl = '[' + jdl + ']'
     result = self.__insertNewJDL( jdl )
     if not result[ 'OK' ]:
-      return S_ERROR( 'Can not insert JDL in to DB' )
-    jobID = result[ 'Value' ]
+      return S_ERROR( 'Can not insert manifest into DB: %s' % result[ 'Message' ] )
 
-    jDesc.setVar( 'JobID', jobID )
-
-    jobAttrNames.append( 'JobID' )
-    jobAttrValues.append( jobID )
-
-    jobAttrNames.append( 'LastUpdateTime' )
-    jobAttrValues.append( Time.toString() )
-
-    jobAttrNames.append( 'SubmissionTime' )
-    jobAttrValues.append( Time.toString() )
-
-    jobAttrNames.append( 'Owner' )
-    jobAttrValues.append( owner )
-
-    jobAttrNames.append( 'OwnerDN' )
-    jobAttrValues.append( ownerDN )
-
-    jobAttrNames.append( 'OwnerGroup' )
-    jobAttrValues.append( ownerGroup )
-
-    jobAttrNames.append( 'DIRACSetup' )
-    jobAttrValues.append( diracSetup )
-
-    # 2.- Check JDL and Prepare DIRAC JDL
-    classAdJob = ClassAd( jDesc.dumpDescriptionAsJDL() )
-    classAdReq = ClassAd( '[]' )
-    retVal = S_OK( jobID )
-    retVal['JobID'] = jobID
-    if not classAdJob.isOK():
-      jobAttrNames.append( 'Status' )
-      jobAttrValues.append( 'Failed' )
-
-      jobAttrNames.append( 'MinorStatus' )
-      jobAttrValues.append( 'Error in JDL syntax' )
-
-      result = self._insert( 'Jobs', jobAttrNames, jobAttrValues )
-      if not result['OK']:
-        return result
-
-      retVal['Status'] = 'Failed'
-      retVal['MinorStatus'] = 'Error in JDL syntax'
-      return retVal
-
-    classAdJob.insertAttributeInt( 'JobID', jobID )
-    result = self.__checkAndPrepareJob( jobID, classAdJob, classAdReq,
+    jid = result[ 'Value' ]
+    result = self.__checkAndPrepareManifest( jobManifest, jid,
                                         owner, ownerDN,
-                                        ownerGroup, diracSetup,
-                                        jobAttrNames, jobAttrValues )
+                                        ownerGroup, diracSetup )
     if not result['OK']:
       return result
 
-    priority = classAdJob.getAttributeInt( 'Priority' )
-    jobAttrNames.append( 'UserPriority' )
-    jobAttrValues.append( priority )
-
-    for jdlName in 'JobName', 'JobType', 'JobGroup', 'RunNumber':
-      # Defaults are set by the DB.
-      jdlValue = classAdJob.getAttributeString( jdlName )
-      if jdlValue:
-        jobAttrNames.append( jdlName )
-        jobAttrValues.append( jdlValue )
-
-    jdlValue = classAdJob.getAttributeString( 'Site' )
-    if jdlValue:
-      jobAttrNames.append( 'Site' )
-      if jdlValue.find( ',' ) != -1:
-        jobAttrValues.append( 'Multiple' )
-      else:
-        jobAttrValues.append( jdlValue )
-
-    jobAttrNames.append( 'VerifiedFlag' )
-    jobAttrValues.append( 'True' )
-
-    jobAttrNames.append( 'Status' )
-    jobAttrValues.append( 'Received' )
-
-    jobAttrNames.append( 'MinorStatus' )
-    jobAttrValues.append( 'Job accepted' )
-
-    reqJDL = classAdReq.asJDL()
-    classAdJob.insertAttributeInt( 'JobRequirements', reqJDL )
-
-    jobJDL = classAdJob.asJDL()
-    
-    # Replace the JobID placeholder if any
-    if jobJDL.find('%j') != -1:
-      jobJDL = jobJDL.replace('%j',str(jobID))
-
-    result = self.setJobJDL( jobID, jobJDL )
+    jobManifest.remove( 'JobRequirements' )
+    result = self.setJobJDL( jid, jobManifest.dumpAsJDL() )
     if not result['OK']:
       return result
 
-    inputData = []
-    if classAdJob.lookupAttribute( 'InputData' ):
-      inputData = classAdJob.getListFromExpression( 'InputData' )
-    values = []
+    attrs = {}
+    attrs[ 'JobID' ] = jid
+    attrs[ 'LastUpdateTime' ] = Time.toString()
+    attrs[ 'SubmissionTime' ] = Time.toString()
+    attrs[ 'Owner' ] = owner
+    attrs[ 'OwnerDN' ] = ownerDN
+    attrs[ 'OwnerGroup' ] = ownerGroup
+    attrs[ 'DIRACSetup' ] = diracSetup
+    attrs[ 'VerifiedFlag' ] = True
+    attrs[ 'Status' ] = 'Received'
+    attrs[ 'MinorStatus' ] = 'Job accepted'
 
-    ret = self._escapeString( jobID )
-    if not ret['OK']:
-      return ret
-    e_jobID = ret['Value']
+    site = jobManifest.getOption( 'Site', [] )
+    if not site:
+      attrs[ 'Site' ] = 'ANY'
+    elif len( site ) > 1:
+      attrs[ 'Site' ] = 'Multiple'
+    else:
+      attrs[ 'Site' ] = site[0]
 
-    for lfn in inputData:
-      # some jobs are setting empty string as InputData
-      if not lfn:
-        continue
-      ret = self._escapeString( lfn.strip() )
-      if not ret['OK']:
-        return ret
-      lfn = ret['Value']
+    if jobManifest.getOption( "Splitter", "" ):
+      attrs[ 'HerdState' ] = "WillSplit"
 
-      values.append( '(%s, %s )' % ( e_jobID, lfn ) )
+    if parentJob == None:
+      parentJob = jid
+    attrs[ 'MasterJobID' ] = parentJob
 
-    if values:
-      cmd = 'INSERT INTO InputData (JobID,LFN) VALUES %s' % ', '.join( values )
-      result = self._update( cmd )
-      if not result['OK']:
-        return result
+    for name in ( 'JobName', 'JobType', 'JobGroup', 'Priority' ):
+      value = jobManifest.getOption( name )
+      if name == 'Priority':
+        name = 'UserPriority'
+      if value:
+        attrs[ name ] = value
 
-    result = self.__setInitialJobParameters( classAdJob, jobID )
+    result = self.insertFields( 'Jobs', inDict = attrs )
     if not result['OK']:
       return result
 
-    result = self._insert( 'Jobs', jobAttrNames, jobAttrValues )
-    if not result['OK']:
-      return result
+    result = S_OK( jid )
+    result[ 'JobID' ] = jid
+    result[ 'Status' ] = 'Received'
+    result[ 'MinorStatus' ] = 'Job accepted'
 
-    retVal['Status'] = 'Received'
-    retVal['MinorStatus'] = 'Job accepted'
+    return result
 
-    return retVal
-
-  def __checkAndPrepareJob( self, jobID, classAdJob, classAdReq, owner, ownerDN,
-                            ownerGroup, diracSetup, jobAttrNames, jobAttrValues ):
+#############################################################################
+  def __checkAndPrepareManifest( self, jobManifest, jid, owner, ownerDN,
+                                 ownerGroup, DIRACSetup ):
     """
       Check Consistency of Submitted JDL and set some defaults
       Prepare subJDL with Job Requirements
     """
-    error = ''
-    vo = getVOForGroup( ownerGroup )
+    VO = Registry.getVOForGroup( ownerGroup )
 
-    jdlDiracSetup = classAdJob.getAttributeString( 'DIRACSetup' )
-    jdlOwner = classAdJob.getAttributeString( 'Owner' )
-    jdlOwnerDN = classAdJob.getAttributeString( 'OwnerDN' )
-    jdlOwnerGroup = classAdJob.getAttributeString( 'OwnerGroup' )
-    jdlVO = classAdJob.getAttributeString( 'VirtualOrganization' )
+    manifestData = { 'OwnerName' : owner, 'OwnerDN': ownerDN, 'OwnerGroup' : ownerGroup,
+                     'DIRACSetup' : DIRACSetup, 'JobID' : jid, 'VirtualOrganization' : VO }
 
-    # The below is commented out since this is always overwritten by the submitter IDs
-    # but the check allows to findout inconsistent client environments
-    if jdlDiracSetup and jdlDiracSetup != diracSetup:
-      error = 'Wrong DIRAC Setup in JDL'
-    if jdlOwner and jdlOwner != owner:
-      error = 'Wrong Owner in JDL'
-    elif jdlOwnerDN and jdlOwnerDN != ownerDN:
-      error = 'Wrong Owner DN in JDL'
-    elif jdlOwnerGroup and jdlOwnerGroup != ownerGroup:
-      error = 'Wrong Owner Group in JDL'
-    elif jdlVO and jdlVO != vo:
-      error = 'Wrong Virtual Organization in JDL'
+    jobManifest.setOptionsFromDict( manifestData )
 
+    if not jobManifest.isOption( 'SubmitPools' ):
+      submitPools = Registry.getVOOption( VO, 'SubmitPools' )
+      if submitPools:
+        jobManifest.setOption( 'SubmitPools', submitPools )
 
-    classAdJob.insertAttributeString( 'Owner', owner )
-    classAdJob.insertAttributeString( 'OwnerDN', ownerDN )
-    classAdJob.insertAttributeString( 'OwnerGroup', ownerGroup )
-    if vo:
-      classAdJob.insertAttributeString( 'VirtualOrganization', vo )
-      submitPool = getVOOption(vo,'SubmitPools')
-      if submitPool and not classAdJob.lookupAttribute( 'SubmitPools' ):
-        classAdJob.insertAttributeString( 'SubmitPools', submitPool )
-
-    classAdReq.insertAttributeString( 'Setup', diracSetup )
-    classAdReq.insertAttributeString( 'OwnerDN', ownerDN )
-    classAdReq.insertAttributeString( 'OwnerGroup', ownerGroup )
-    if vo:
-      classAdReq.insertAttributeString( 'VirtualOrganization', vo )
-
-    setup = gConfig.getValue( '/DIRAC/Setup', '' )
-    voPolicyDict = gConfig.getOptionsDict( '/DIRAC/VOPolicy/%s/%s' % ( vo, setup ) )
-    #voPolicyDict = gConfig.getOptionsDict('/DIRAC/VOPolicy')
+    voPolicyDict = gConfig.getOptionsDict( '/DIRAC/VOPolicy/%s/%s' % ( VO, DIRACSetup ) )
     if voPolicyDict['OK']:
       voPolicy = voPolicyDict['Value']
-      for param, val in voPolicy.items():
-        if not classAdJob.lookupAttribute( param ):
-          classAdJob.insertAttributeString( param, val )
+      for k in voPolicy:
+        if not jobManifest.isOption( k ):
+          jobManifest.setOption( k, voPolicy[ k ] )
 
-    priority = classAdJob.getAttributeInt( 'Priority' )
-    systemConfig = classAdJob.getAttributeString( 'SystemConfig' )
-    cpuTime = classAdJob.getAttributeInt( 'MaxCPUTime' )
+    jobManifest.remove( "JobRequirements" )
+    result = jobManifest.check()
+    if not result['OK']:
+      return result
 
-    classAdReq.insertAttributeInt( 'UserPriority', priority )
-
-    classAdReq.insertAttributeInt( 'CPUTime', cpuTime )
-
-    if systemConfig and systemConfig.lower() != 'any':
-      # FIXME: need to reformulate in a VO independent mode
-      # Get the LHCb Platforms that are compatible with the requested systemConfig
-      result = gConfig.getOptionsDict( '/Resources/Computing/OSCompatibility' )
-      if result['OK'] and result['Value']:
-        platforms = result['Value']
-        lhcbPlatforms = []
-        for platform in platforms:
-          if systemConfig in [ x.strip() for x in platforms[platform].split( ',' ) ]:
-            lhcbPlatforms.append( platform )
-        if lhcbPlatforms:
-          classAdReq.insertAttributeVectorString( 'LHCbPlatforms', lhcbPlatforms )
-        else:
-          error = 'No compatible Platform found for %s' % systemConfig
-
-    if error:
-
-      retVal = S_ERROR( error )
-      retVal['JobId'] = jobID
-      retVal['Status'] = 'Failed'
-      retVal['MinorStatus'] = error
-
-      jobAttrNames.append( 'Status' )
-      jobAttrValues.append( 'Failed' )
-
-      jobAttrNames.append( 'MinorStatus' )
-      jobAttrValues.append( error )
-      resultInsert = self.setJobAttributes( jobID, jobAttrNames, jobAttrValues )
-      if not resultInsert['OK']:
-        retVal['MinorStatus'] += '; %s' % resultInsert['Message']
-
-      return retVal
-
+    jobManifest.expand()
     return S_OK()
 
 
@@ -1486,40 +1736,30 @@ class JobDB( DB ):
        in various tables
     """
 
-    #ret = self._escapeString(jobID)
-    #if not ret['OK']:
+    # ret = self._escapeString(jobID)
+    # if not ret['OK']:
     #  return ret
-    #e_jobID = ret['Value']
+    # e_jobID = ret['Value']
 
     if type( jobIDs ) != type( [] ):
       jobIDList = [jobIDs]
     else:
       jobIDList = jobIDs
 
-    # If this is a master job delete the children first
-    failedSubjobList = []
-    for jobID in jobIDList:
-      result = self.getJobAttribute( jobID, 'JobSplitType' )
-      if result['OK']:
-        if result['Value'] == "Master":
-          result = self.getSubjobs( jobID )
-          if result['OK']:
-            subjobs = result['Value']
-            if subjobs:
-              result = self.removeJobFromDB( subjobs )
-              if not result['OK']:
-                failedSubjobList += subjobs
-                self.log.error( "Failed to delete subjobs " + str( subjobs ) + " from JobDB" )
-
     failedTablesList = []
-    jobIDString = ','.join( [str( j ) for j in jobIDList] )
+    jobIDString = ','.join( [str( int( j ) ) for j in jobIDList] )
+    cmd = "DELETE LFN, Replicas FROM LFN, Replicas WHERE Replicas.LFNID = LFN.LFNID AND LFN.JobID in (%s)" % jobIDString
+    result = self._update( cmd )
+    if not result[ 'OK' ]:
+      return result
     for table in ( 'JobJDLs',
                    'InputData',
                    'JobParameters',
                    'AtticJobParameters',
                    'HeartBeatLoggingInfo',
                    'OptimizerParameters',
-                   'Jobs'
+                   'Jobs',
+                   'MasterJDLs'
                    ):
 
       cmd = 'DELETE FROM %s WHERE JobID in (%s)' % ( table, jobIDString )
@@ -1528,9 +1768,9 @@ class JobDB( DB ):
         failedTablesList.append( table )
 
     result = S_OK()
-    if failedSubjobList:
-      result = S_ERROR( 'Errors while job removal' )
-      result['FailedSubjobs'] = failedSubjobList
+    #if failedSubjobList:
+    #  result = S_ERROR( 'Errors while job removal' )
+    #  result['FailedSubjobs'] = failedSubjobList
     if failedTablesList:
       result = S_ERROR( 'Errors while job removal' )
       result['FailedTables'] = failedTablesList
@@ -1538,29 +1778,9 @@ class JobDB( DB ):
     return result
 
 #################################################################
-  def getSubjobs( self, jobID ):
-    """ Get subjobs of the given job
-    """
-    ret = self._escapeString( jobID )
-    if not ret['OK']:
-      return ret
-    jobID = ret['Value']
-
-    cmd = "SELECT SubJobID FROM SubJobs WHERE JobID=%s" % jobID
-    result = self._query( cmd )
-    subjobs = []
-    if result['OK']:
-      subjobs = [ int( x[0] ) for x in result['Value']]
-      return S_OK( subjobs )
-    else:
-      return result
-
-#################################################################
   def rescheduleJobs( self, jobIDs ):
     """ Reschedule all the jobs in the given list
     """
-
-    result = S_OK()
 
     failedJobs = []
     for jobID in jobIDs:
@@ -1572,322 +1792,148 @@ class JobDB( DB ):
       result = S_ERROR( 'JobDB.rescheduleJobs: Not all the jobs were rescheduled' )
       result['FailedJobs'] = failedJobs
 
-    return result
+    return S_OK()
 
 #############################################################################
-  def rescheduleJob ( self, jobID ):
+  def __failJob( self, jid, minor, errMsg ):
+    result = self.setJobStatus( jid, status = 'Failed', minor = minor )
+    ret = S_ERROR( errMsg )
+    if result[ 'OK' ]:
+      ret.update( { 'Status' : 'Failed', 'MinorStatus' : minor } )
+    return ret
+
+#############################################################################
+  def resetJob( self, jid ):
+    result = self.setJobAttributes( jid, [ 'RescheduleCounter' ], [ -1 ] )
+    if not result[ 'OK' ]:
+      return self.__failJob( jid, "Error resetting job", "Error setting reschedule counter: %s" % result[ 'Message' ] )
+    result = self.clearAtticParameters( jid )
+    if not result[ 'OK' ]:
+      return self.__failJob( jid, "Error cleaning attic", "Error cleaning attic: %s" % result[ 'Message' ] )
+    return self.rescheduleJob( jid )
+
+
+#############################################################################
+  def rescheduleJob ( self, jid ):
     """ Reschedule the given job to run again from scratch. Retain the already
         defined parameters in the parameter Attic
     """
+    #I feel dirty after looking at this method
+
+    try:
+      jid = int( jid )
+    except ValueError:
+      return S_ERROR( "jid is not an number! Get out!" )
+
     # Check Verified Flag
-    result = self.getJobAttributes( jobID, ['Status', 'MinorStatus', 'VerifiedFlag', 'RescheduleCounter',
+    result = self.getJobAttributes( jid, ['Status', 'MinorStatus', 'VerifiedFlag', 'RescheduleCounter',
                                      'Owner', 'OwnerDN', 'OwnerGroup', 'DIRACSetup'] )
-    if result['OK']:
-      resultDict = result['Value']
-    else:
-      return S_ERROR( 'JobDB.getJobAttributes: can not retrieve job attributes' )
+    if not result['OK']:
+      return S_ERROR( 'JobDB.getJobAttributes: Job %d does not exist' % jid )
+    attrs = result['Value']
 
-    if not 'VerifiedFlag' in resultDict:
-      return S_ERROR( 'Job ' + str( jobID ) + ' not found in the system' )
-
-    if not resultDict['VerifiedFlag']:
-      return S_ERROR( 'Job %s not Verified: Status = %s, MinorStatus = %s' % ( 
-                                                                             jobID,
-                                                                             resultDict['Status'],
-                                                                             resultDict['MinorStatus'] ) )
+    #This is useless?
+    if not attrs['VerifiedFlag']:
+      return S_ERROR( 'Job %s not Verified: Status = %s, MinorStatus = %s' % (
+                                                                             jid,
+                                                                             attrs['Status'],
+                                                                             attrs['MinorStatus'] ) )
 
 
     # Check the Reschedule counter first
-    rescheduleCounter = int( resultDict['RescheduleCounter'] ) + 1
+    rescheduleCounter = int( attrs['RescheduleCounter'] ) + 1
 
     self.maxRescheduling = gConfig.getValue( self.cs_path + '/MaxRescheduling', self.maxRescheduling )
 
     # Exit if the limit of the reschedulings is reached
     if rescheduleCounter > self.maxRescheduling:
-      self.log.error( 'Maximum number of reschedulings is reached', 'Job %s' % jobID )
-      res = self.setJobStatus( jobID, status = 'Failed', minor = 'Maximum of reschedulings reached' )
+<<<<<<< HEAD
+      self.log.warn( 'Maximum number of reschedulings is reached', 'Job %s' % jid )
+      return self.__failJob( jid, 'Maximum of reschedulings reached',
+                             'Maximum number of reschedulings is reached: %s' % self.maxRescheduling )
+=======
+      self.log.warn( 'Maximum number of reschedulings is reached', 'Job %s' % jobID )
+      self.setJobStatus( jobID, status = 'Failed', minor = 'Maximum of reschedulings reached' )
       return S_ERROR( 'Maximum number of reschedulings is reached: %s' % self.maxRescheduling )
+>>>>>>> rel-v6r11
 
-    jobAttrNames = []
-    jobAttrValues = []
-
-    jobAttrNames.append( 'RescheduleCounter' )
-    jobAttrValues.append( rescheduleCounter )
 
     # Save the job parameters for later debugging
-    result = self.getJobParameters( jobID )
+    result = self.getJobParameters( jid )
     if result['OK']:
       parDict = result['Value']
-      for key, value in parDict.items():
-        result = self.setAtticJobParameter( jobID, key, value, rescheduleCounter - 1 )
-        if not result['OK']:
-          break
+      result = self.setAtticParameters( jid, rescheduleCounter - 1, parDict )
+      if not result['OK']:
+        return self.__failJob( jid, "Error setting parameter", "Can't set attic parameter: %s" % result[ 'Message' ] )
 
-    ret = self._escapeString( jobID )
-    if not ret['OK']:
-      return ret
-    e_jobID = ret['Value']
+    for tableName in ( 'JobParameters', 'OptimizerParameters' ):
+      cmd = 'DELETE FROM JobParameters WHERE JobID=%d' % jid
+      res = self._update( cmd )
+      if not res['OK']:
+        return self.__failJob( jid, "Error cleaning %s" % tableName,
+                                    "Can't clean %s: %s" % ( tableName, res[ 'Message' ] ) )
 
-    cmd = 'DELETE FROM JobParameters WHERE JobID=%s' % e_jobID
-    res = self._update( cmd )
-    if not res['OK']:
-      return res
+    result = self.__cleanInputData( jid )
+    if not result[ 'OK' ]:
+      return self.__failJob( jid, "Error rescheduling", "Can't clean input data: %s" % result[ 'Message' ] )
 
     # the Jobreceiver needs to know if there is InputData ??? to decide which optimizer to call
     # proposal: - use the getInputData method
-    res = self.getJobJDL( jobID, original = True )
+    res = self.getJobJDL( jid, original = True )
     if not res['OK']:
-      return res
+      return self.__failJob( jid, "Error getting JDL", "Can't retrieve JDL: %s" % res[ 'Value' ] )
 
     jdl = res['Value']
     # Fix the possible lack of the brackets in the JDL
     if jdl.strip()[0].find( '[' ) != 0 :
-      jdl = '[' + jdl + ']'
-    classAdJob = ClassAd( jdl )
-    classAdReq = ClassAd( '[]' )
-    retVal = S_OK( jobID )
-    retVal['JobID'] = jobID
+      jdl = '[%s]' % jdl
+    jobManifest = JobManifest()
+    jobManifest.loadJDL( jdl )
 
-    classAdJob.insertAttributeInt( 'JobID', jobID )
-    result = self.__checkAndPrepareJob( jobID, classAdJob, classAdReq, resultDict['Owner'],
-                                        resultDict['OwnerDN'], resultDict['OwnerGroup'],
-                                        resultDict['DIRACSetup'],
-                                        jobAttrNames, jobAttrValues )
+    result = self.__checkAndPrepareManifest( jobManifest, jid, attrs['Owner'],
+                                             attrs['OwnerDN'], attrs['OwnerGroup'],
+                                             attrs['DIRACSetup'] )
 
     if not result['OK']:
-      return result
+      return self.__failJob( jid, "Error prepare JDL", "Can't prepare JDL: %s" % res[ 'Value' ] )
 
-    priority = classAdJob.getAttributeInt( 'Priority' )
-    jobAttrNames.append( 'UserPriority' )
-    jobAttrValues.append( priority )
+    result = self.setJobJDL( jid, jobManifest.dumpAsJDL() )
+    if not result['OK']:
+      return self.__failJob( jid, "Error setting JDL", "Can't set JDL: %s" % res[ 'Value' ] )
 
-    site = classAdJob.getAttributeString( 'Site' )
+
+    attrs = {}
+    attrs[ 'RescheduleCounter' ] = rescheduleCounter
+    attrs[ 'Status' ] = 'Received'
+    attrs[ 'MinorStatus' ] = 'Job accepted'
+    attrs[ 'ApplicationStatus' ] = 'Unknown'
+    attrs[ 'ApplicationNumStatus' ] = 0
+    attrs[ 'RescheduleTime' ] = Time.toString()
+    attrs[ 'LastUpdateTime' ] = Time.toString()
+    attrs[ 'SubmissionTime' ] = Time.toString()
+
+    site = jobManifest.getOption( 'Site', [] )
     if not site:
-      site = 'ANY'
-    elif site.find(',') > 0:
-      site = "Multiple"  
-    jobAttrNames.append( 'Site' )
-    jobAttrValues.append( site )
+      attrs[ 'Site' ] = 'ANY'
+    elif len( site ) > 1:
+      attrs[ 'Site' ] = 'Multiple'
+    else:
+      attrs[ 'Site' ] = site[0]
 
-    jobAttrNames.append( 'Status' )
-    jobAttrValues.append( 'Received' )
 
-    jobAttrNames.append( 'MinorStatus' )
-    jobAttrValues.append( 'Job Rescheduled' )
-
-    jobAttrNames.append( 'ApplicationStatus' )
-    jobAttrValues.append( 'Unknown' )
-
-    jobAttrNames.append( 'ApplicationNumStatus' )
-    jobAttrValues.append( 0 )
-
-    jobAttrNames.append( 'LastUpdateTime' )
-    jobAttrValues.append( Time.toString() )
-
-    jobAttrNames.append( 'RescheduleTime' )
-    jobAttrValues.append( Time.toString() )
-
-    reqJDL = classAdReq.asJDL()
-    classAdJob.insertAttributeInt( 'JobRequirements', reqJDL )
-
-    jobJDL = classAdJob.asJDL()
-
-    result = self.setJobJDL( jobID, jobJDL )
+    result = self.updateFields( 'Jobs', condDict = { 'JobID' : jid },
+                                updateDict = attrs )
     if not result['OK']:
-      return result
+      return self.__failJob( jid, "Error setting attrs", "Can't set attributes: %s" % res[ 'Value' ] )
 
-    result = self.__setInitialJobParameters( classAdJob, jobID )
-    if not result['OK']:
-      return result
-
-    result = self.setJobAttributes( jobID, jobAttrNames, jobAttrValues )
-    if not result['OK']:
-      return result
-
-    retVal['InputData'] = classAdJob.lookupAttribute( "InputData" )
+    retVal = S_OK( jid )
+    retVal['JobID'] = jid
+    retVal['InputData'] = jobManifest.getOption( "InputData" )
     retVal['RescheduleCounter'] = rescheduleCounter
     retVal['Status'] = 'Received'
     retVal['MinorStatus'] = 'Job Rescheduled'
 
     return retVal
-
-#############################################################################
-  def getSiteMask( self, siteState = 'Active' ):
-    """ Get the currently active site list
-    """
-
-    ret = self._escapeString( siteState )
-    if not ret['OK']:
-      return ret
-    siteState = ret['Value']
-
-    if siteState == "All":
-      cmd = "SELECT Site FROM SiteMask"
-    else:
-      cmd = "SELECT Site FROM SiteMask WHERE Status=%s" % siteState
-
-    result = self._query( cmd )
-    siteList = []
-    if result['OK']:
-      siteList = [ x[0] for x in result['Value']]
-
-    return S_OK( siteList )
-
-#############################################################################
-  def getSiteMaskStatus( self ):
-    """ Get the currently site mask status
-    """
-    cmd = "SELECT Site,Status FROM SiteMask"
-
-    result = self._query( cmd )
-    siteDict = {}
-    if result['OK']:
-      for site, status in result['Value']:
-        siteDict[site] = status
-
-    return S_OK( siteDict )
-
-#############################################################################
-  def setSiteMask( self, siteMaskList, authorDN = 'Unknown', comment = 'No comment' ):
-    """ Set the Site Mask to the given mask in a form of a list of tuples (site,status)
-    """
-
-    for site, status in siteMaskList:
-      result = self.__setSiteStatusInMask( site, status, authorDN, comment )
-      if not result['OK']:
-        return result
-
-    return S_OK()
-
-#############################################################################
-  def __setSiteStatusInMask( self, site, status, authorDN = 'Unknown', comment = 'No comment' ):
-    """  Set the given site status to 'status' or add a new active site
-    """
-
-    result = self._escapeString( site )
-    if not result['OK']:
-      return result
-    site = result['Value']
-
-    result = self._escapeString( status )
-    if not result['OK']:
-      return result
-    status = result['Value']
-
-    result = self._escapeString( authorDN )
-    if not result['OK']:
-      return result
-    authorDN = result['Value']
-
-    result = self._escapeString( comment )
-    if not result['OK']:
-      return result
-    comment = result['Value']
-
-
-
-    req = "SELECT Status FROM SiteMask WHERE Site=%s" % site
-    result = self._query( req )
-    if result['OK']:
-      if len( result['Value'] ) > 0:
-        current_status = result['Value'][0][0]
-        if current_status == status:
-          return S_OK()
-        else:
-          req = "UPDATE SiteMask SET Status=%s,LastUpdateTime=UTC_TIMESTAMP()," \
-                 "Author=%s, Comment=%s WHERE Site=%s"
-          req = req % ( status, authorDN, comment, site )
-      else:
-        req = "INSERT INTO SiteMask VALUES (%s,%s,UTC_TIMESTAMP(),%s,%s)" % ( site, status, authorDN, comment )
-      result = self._update( req )
-      if not result['OK']:
-        return S_ERROR( 'Failed to update the Site Mask' )
-      # update the site mask logging record
-      req = "INSERT INTO SiteMaskLogging VALUES (%s,%s,UTC_TIMESTAMP(),%s,%s)" % ( site, status, authorDN, comment )
-      result = self._update( req )
-      if not result['OK']:
-        self.log.warn( 'Failed to update site mask logging for %s' % site )
-    else:
-      return S_ERROR( 'Failed to get the Site Status from the Mask' )
-
-    return S_OK()
-
-#############################################################################
-  def banSiteInMask( self, site, authorDN = 'Unknown', comment = 'No comment' ):
-    """  Forbid the given site in the Site Mask
-    """
-
-    result = self.__setSiteStatusInMask( site, 'Banned', authorDN, comment )
-    return result
-
-#############################################################################
-  def allowSiteInMask( self, site, authorDN = 'Unknown', comment = 'No comment' ):
-    """  Forbid the given site in the Site Mask
-    """
-
-    result = self.__setSiteStatusInMask( site, 'Active', authorDN, comment )
-    return result
-
-#############################################################################
-  def removeSiteFromMask( self, site ):
-    """ Remove the given site from the mask
-    """
-    ret = self._escapeString( site )
-    if not ret['OK']:
-      return ret
-    site = ret['Value']
-
-    if site == "All":
-      req = "DELETE FROM SiteMask"
-    else:
-      req = "DELETE FROM SiteMask WHERE Site=%s" % site
-    return self._update( req )
-
-#############################################################################
-  def getSiteMaskLogging( self, siteList ):
-    """ Get the site mask logging history for the list if site names
-    """
-
-    if siteList:
-      siteString = ','.join( [ "'" + x + "'" for x in siteList ] )
-      req = "SELECT Site,Status,UpdateTime,Author,Comment FROM SiteMaskLogging WHERE Site in (%s)" % siteString
-    else:
-      req = "SELECT Site,Status,UpdateTime,Author,Comment FROM SiteMaskLogging"
-    req += " ORDER BY UpdateTime ASC"
-
-    result = self._query( req )
-    if not result['OK']:
-      return result
-
-    availableSiteList = []
-    for row in result['Value']:
-      site, status, utime, author, comment = row
-      availableSiteList.append( site )
-
-    resultDict = {}
-    for site in siteList:
-      if not result['Value'] or site not in availableSiteList:
-        ret = self._escapeString( site )
-        if not ret['OK']:
-          continue
-        e_site = ret['Value']
-        req = "SELECT Status Site,Status,LastUpdateTime,Author,Comment FROM SiteMask WHERE Site=%s" % e_site
-        resSite = self._query( req )
-        if resSite['OK']:
-          if resSite['Value']:
-            site, status, lastUpdate, author, comment = resSite['Value'][0]
-            resultDict[site] = [( status, str( lastUpdate ), author, comment )]
-          else:
-            resultDict[site] = [( 'Unknown', '', '', 'Site not present in logging table' )]
-
-
-    for row in result['Value']:
-      site, status, utime, author, comment = row
-      if not resultDict.has_key( site ):
-        resultDict[site] = []
-      resultDict[site].append( ( status, str( utime ), author, comment ) )
-
-    return S_OK( resultDict )
 
 #############################################################################
   def setSandboxReady( self, jobID, stype = 'InputSandbox' ):
@@ -1990,36 +2036,43 @@ class JobDB( DB ):
                                  timeStamp = 'EndExecTime' )
 
     # Get the site mask status
+    siteStatus = SiteStatus()
     siteMask = {}
-    resultMask = self.getSiteMask( 'All' )
+    resultMask = getSites( fullName = True )
     if resultMask['OK']:
       for site in resultMask['Value']:
         siteMask[site] = 'NoMask'
-    resultMask = self.getSiteMask( 'Active' )
+    resultMask = siteStatus.getUsableSites( 'ComputingAccess' )
     if resultMask['OK']:
       for site in resultMask['Value']:
         siteMask[site] = 'Active'
-    resultMask = self.getSiteMask( 'Banned' )
+    resultMask = siteStatus.getUnusableSites( 'ComputingAccess' )
     if resultMask['OK']:
       for site in resultMask['Value']:
         siteMask[site] = 'Banned'
 
     # Sort out different counters
     resultDict = {}
-    for attDict, count in result['Value']:
-      siteFullName = attDict['Site']
-      status = attDict['Status']
-      if not resultDict.has_key( siteFullName ):
-        resultDict[siteFullName] = {}
-        for state in JOB_STATES:
-          resultDict[siteFullName][state] = 0
-      if status not in JOB_FINAL_STATES:
-        resultDict[siteFullName][status] = count
-    for attDict, count in resultDay['Value']:
-      siteFullName = attDict['Site']
-      status = attDict['Status']
-      if status in JOB_FINAL_STATES:
-        resultDict[siteFullName][status] = count
+    if result['OK']:
+      for attDict, count in result['Value']:
+        siteFullName = attDict['Site']
+        status = attDict['Status']
+        if not resultDict.has_key( siteFullName ):
+          resultDict[siteFullName] = {}
+          for state in JOB_STATES:
+            resultDict[siteFullName][state] = 0
+        if status not in JOB_FINAL_STATES:
+          resultDict[siteFullName][status] = count
+    if resultDay['OK']:
+      for attDict, count in resultDay['Value']:
+        siteFullName = attDict['Site']
+        if not resultDict.has_key( siteFullName ):
+          resultDict[siteFullName] = {}
+          for state in JOB_STATES:
+            resultDict[siteFullName][state] = 0
+        status = attDict['Status']
+        if status in JOB_FINAL_STATES:
+          resultDict[siteFullName][status] = count
 
     # Collect records now
     records = []
@@ -2129,7 +2182,7 @@ class JobDB( DB ):
     if selectDict.has_key( 'Owner' ):
       username = selectDict['Owner']
       del selectDict['Owner']
-      result = getDNForUsername( username )
+      result = Registry.getDNForUsername( username )
       if result['OK']:
         selectDict['OwnerDN'] = result['Value']
       else:
@@ -2171,7 +2224,7 @@ class JobDB( DB ):
     for owner in resultDict:
       totalUser[owner] = 0
       for group in resultDict[owner]:
-        result = getUsernameForDN( owner )
+        result = Registry.getUsernameForDN( owner )
         if result['OK']:
           username = result['Value']
         else:
@@ -2258,8 +2311,6 @@ class JobDB( DB ):
         ok = False
         self.log.warn( result['Message'] )
 
-    #print "AT >>>> insertion time ",time.time()-start
-
     if ok:
       return S_OK()
     else:
@@ -2317,7 +2368,7 @@ class JobDB( DB ):
     result = self._update( req )
     return result
 
- #####################################################################################
+#####################################################################################
   def getJobCommand( self, jobID, status = 'Received' ):
     """ Get a command to be passed to the job together with the
         next heart beat
@@ -2374,7 +2425,7 @@ class JobDB( DB ):
     """
     if not requestedFields:
       requestedFields = [ 'Status', 'MinorStatus',
-                  'Site', 'Owner', 'OwnerGroup', 'JobGroup', 'JobSplitType' ]
+                  'Site', 'Owner', 'OwnerGroup', 'JobGroup', 'HerdState' ]
     defFields = [ 'DIRACSetup' ] + requestedFields
     valueFields = [ 'COUNT(JobID)', 'SUM(RescheduleCounter)' ]
     defString = ", ".join( defFields )

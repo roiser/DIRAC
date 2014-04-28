@@ -1,17 +1,17 @@
 """ This is the Proxy storage element client """
 
-
 __RCSID__ = "$Id$"
 
-from DIRAC                                              import gLogger, gConfig, S_OK, S_ERROR
+from DIRAC                                              import gLogger, S_OK, S_ERROR
+from DIRAC.Resources.Utilities.Utils                    import checkArgumentFormat
 from DIRAC.Resources.Storage.StorageBase                import StorageBase
 from DIRAC.ConfigurationSystem.Client                   import PathFinder
 from DIRAC.Core.DISET.RPCClient                         import RPCClient
 from DIRAC.Core.DISET.TransferClient                    import TransferClient
 from DIRAC.Core.Utilities.File                          import getSize
-from DIRAC.Core.Utilities.Pfn                           import pfnparse, pfnunparse
+from DIRAC.Core.Utilities.Pfn                           import pfnunparse
 
-import types, os
+import os
 
 class ProxyStorage( StorageBase ):
 
@@ -60,7 +60,7 @@ class ProxyStorage( StorageBase ):
   ######################################
 
   def getFile( self, path, localPath = False ):
-    res = self.__checkArgumentFormatDict( path )
+    res = checkArgumentFormat( path )
     if not res['OK']:
       return res
     urls = res['Value']
@@ -99,12 +99,15 @@ class ProxyStorage( StorageBase ):
     return S_OK( resDict )
 
   def putFile( self, path, sourceSize = 0 ):
+
     client = RPCClient( self.url )
+
     if sourceSize:
       gLogger.debug( "ProxyStorage.putFile: The client has provided the source file size implying a replication is requested." )
-      return client.callProxyMethod( self.name, 'putFile', path, {'sourceSize':sourceSize} )
+      return client.callProxyMethod( self.name, 'putFile', [path], {'sourceSize':sourceSize} )
+
     gLogger.debug( "ProxyStorage.putFile: No source size was provided therefore a simple put will be performed." )
-    res = self.__checkArgumentFormatDict( path )
+    res = checkArgumentFormat( path )
     if not res['OK']:
       return res
     urls = res['Value']
@@ -119,7 +122,7 @@ class ProxyStorage( StorageBase ):
         gLogger.error( "ProxyStorage.putFile: Failed to send file to proxy server.", res['Message'] )
         failed[dest_url] = res['Message']
       else:
-        res = client.uploadFile( self.name, src_file )
+        res = client.uploadFile( self.name, dest_url )
         if not res['OK']:
           gLogger.error( "ProxyStorage.putFile: Failed to upload file to storage element from proxy server.", res['Message'] )
           failed[dest_url] = res['Message']
@@ -139,43 +142,43 @@ class ProxyStorage( StorageBase ):
 
   def exists( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'exists', path )
+    return client.callProxyMethod( self.name, 'exists', [path], {} )
 
   def isFile( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'isFile', path )
+    return client.callProxyMethod( self.name, 'isFile', [path], {} )
 
   def getFileSize( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'getFileSize', path )
+    return client.callProxyMethod( self.name, 'getFileSize', [path], {} )
 
   def getFileMetadata( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'getFileMetadata', path )
+    return client.callProxyMethod( self.name, 'getFileMetadata', [path], {} )
 
   def getTransportURL( self, path, protocols = False ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'getTransportURL', path, {'protocols':protocols} )
+    return client.callProxyMethod( self.name, 'getTransportURL', [path], {'protocols':protocols} )
 
   def removeFile( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'removeFile', path )
+    return client.callProxyMethod( self.name, 'removeFile', [path], {} )
 
   def prestageFile( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'prestageFile', path )
+    return client.callProxyMethod( self.name, 'prestageFile', [path], {} )
 
   def prestageFileStatus( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'prestageFileStatus', path )
+    return client.callProxyMethod( self.name, 'prestageFileStatus', [path], {} )
 
   def pinFile( self, path, lifetime = 60 * 60 * 24 ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'pinFile', path, {'lifetime':lifetime} )
+    return client.callProxyMethod( self.name, 'pinFile', [path], {'lifetime':lifetime} )
 
   def releaseFile( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'releaseFile', path )
+    return client.callProxyMethod( self.name, 'releaseFile', [path], {} )
 
   ######################################
   # Directory manipulation functionalities
@@ -183,27 +186,31 @@ class ProxyStorage( StorageBase ):
 
   def isDirectory( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'isDirectory', path )
+    return client.callProxyMethod( self.name, 'isDirectory', [path], {} )
 
   def getDirectoryMetadata( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'getDirectoryMetadata', path )
+    return client.callProxyMethod( self.name, 'getDirectoryMetadata', [path], {} )
 
   def getDirectorySize( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'getDirectorySize', path )
+    return client.callProxyMethod( self.name, 'getDirectorySize', [path], {} )
 
   def listDirectory( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'listDirectory', path )
+    return client.callProxyMethod( self.name, 'listDirectory', [path], {} )
 
   def createDirectory( self, path ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'createDirectory', path )
+    return client.callProxyMethod( self.name, 'createDirectory', [path], {} )
 
   def removeDirectory( self, path, recursive = False ):
     client = RPCClient( self.url )
-    return client.callProxyMethod( self.name, 'removeDirectory', path, {'recursive':recursive} )
+    return client.callProxyMethod( self.name, 'removeDirectory', [path], {'recursive':recursive} )
+
+  def getPFNBase( self ):
+    client = RPCClient( self.url )
+    return client.callProxyMethod( self.name, 'getPFNBase', [], {} )
 
   def getDirectory( self, path ):
     return S_ERROR( "Not supported" )
@@ -211,32 +218,18 @@ class ProxyStorage( StorageBase ):
   def putDirectory( self, path ):
     return S_ERROR( "Not supported" )
 
-  def __checkArgumentFormatDict( self, path ):
-    if type( path ) in types.StringTypes:
-      urls = {path:False}
-    elif type( path ) == types.ListType:
-      urls = {}
-      for url in path:
-        urls[url] = False
-    elif type( path ) == types.DictType:
-      urls = path
-    else:
-      return S_ERROR( "ProxyStorage.__checkArgumentFormatDict: Supplied path is not of the correct format." )
-    return S_OK( urls )
-
   def __executeOperation( self, url, method ):
     """ Executes the requested functionality with the supplied url
     """
-    execString = "res = self.%s(url)" % method
-    try:
-      exec( execString )
-      if not res['OK']:
-        return S_ERROR( res['Message'] )
-      elif not res['Value']['Successful'].has_key( url ):
-        return S_ERROR( res['Value']['Failed'][url] )
-      else:
-        return S_OK( res['Value']['Successful'][url] )
-    except AttributeError, errMessage:
-      exceptStr = "ProxyStorage.__executeOperation: Exception while perfoming %s." % method
-      gLogger.exception( exceptStr, '', errMessage )
-      return S_ERROR( "%s%s" % ( exceptStr, errMessage ) )
+    fcn = None
+    if hasattr( self, method ) and callable( getattr( self, method ) ):
+      fcn = getattr( self, method )
+    if not fcn:
+      return S_ERROR( "Unable to invoke %s, it isn't a member function of ProxyStorage" % method )
+    res = fcn( [url] )
+    if not res['OK']:
+      return res
+    elif url not in res['Value']['Successful']:
+      return S_ERROR( res['Value']['Failed'][url] )
+    return S_OK( res['Value']['Successful'][url] )
+

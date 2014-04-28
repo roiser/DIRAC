@@ -6,27 +6,19 @@
 __RCSID__ = "$Id$"
 
 from types import *
-import os
-from DIRAC import S_OK, S_ERROR, gConfig, shellCall, systemCall, rootPath, gLogger
+import os, re, commands, getpass
+from datetime import timedelta
+from DIRAC import S_OK, S_ERROR, gConfig, rootPath, gLogger
 from DIRAC.Core.DISET.RequestHandler import RequestHandler
 from DIRAC.ConfigurationSystem.Client.Helpers.CSGlobals import getCSExtensions
-from DIRAC.Core.Utilities import InstallTools, CFG
+from DIRAC.Core.Utilities import InstallTools, CFG, Os
 from DIRAC.Core.Utilities.Time import dateTime, fromString, hour, day
-
-cmDB = None
-
-def initializeSystemAdministratorHandler( serviceInfo ):
-
-  global cmDB
-  #try:
-  #  cmDB = ComponentMonitoringDB()
-  #except Exception,x:
-  #  gLogger.warn('Failed to create an instance of ComponentMonitoringDB ')
-  return S_OK()
-
+from DIRAC.Core.Utilities.Subprocess import shellCall, systemCall
+from DIRAC.Core.Security.Locations import getHostCertificateAndKeyLocation
+from DIRAC.Core.Security.X509Chain import X509Chain
+import DIRAC
 
 class SystemAdministratorHandler( RequestHandler ):
-
 
   types_getInfo = [ ]
   def export_getInfo( self ):
@@ -61,7 +53,19 @@ class SystemAdministratorHandler( RequestHandler ):
     """  Get the complete status information for the components in the
          given list
     """
-    return InstallTools.getOverallStatus( getCSExtensions() )
+    result = InstallTools.getOverallStatus( getCSExtensions() )
+    if not result['OK']:
+      return result
+    statusDict = result['Value']
+    for compType in statusDict:
+      for system in statusDict[compType]:
+        for component in statusDict[compType][system]:
+          result = InstallTools.getComponentModule( gConfig,system,component,compType )
+          if not result['OK']:
+            statusDict[compType][system][component]['Module'] = "Unknown"
+          else:
+            statusDict[compType][system][component]['Module'] = result['Value']
+    return S_OK(statusDict)   
 
   types_getStartupComponentStatus = [ ListType ]
   def export_getStartupComponentStatus( self, componentTupleList ):
@@ -71,17 +75,19 @@ class SystemAdministratorHandler( RequestHandler ):
     return InstallTools.getStartupComponentStatus( componentTupleList )
 
   types_installComponent = [ StringTypes, StringTypes, StringTypes ]
-  def export_installComponent( self, componentType, system, component ):
+  def export_installComponent( self, componentType, system, component, componentModule='' ):
     """ Install runit directory for the specified component
     """
-    return InstallTools.installComponent( componentType, system, component, getCSExtensions() )
+    return InstallTools.installComponent( componentType, system, component, getCSExtensions(), componentModule )
 
   types_setupComponent = [ StringTypes, StringTypes, StringTypes ]
-  def export_setupComponent( self, componentType, system, component ):
+  def export_setupComponent( self, componentType, system, component, componentModule='' ):
     """ Setup the specified component for running with the runsvdir daemon
         It implies installComponent
     """
-    return InstallTools.setupComponent( componentType, system, component, getCSExtensions() )
+    result = InstallTools.setupComponent( componentType, system, component, getCSExtensions(), componentModule )
+    gConfig.forceRefresh()
+    return result
 
   types_addDefaultOptionsToComponentCfg = [ StringTypes, StringTypes ]
   def export_addDefaultOptionsToComponentCfg( self, componentType, system, component ):
@@ -210,7 +216,7 @@ class SystemAdministratorHandler( RequestHandler ):
     if oracleFlag.lower() in ['yes', 'true', '1']:
       installOracleClient = True
     elif oracleFlag.lower() == "unknown":
-      result = systemCall( 0, ['python', '-c', 'import cx_Oracle'] )
+      result = systemCall( 30, ['python', '-c', 'import cx_Oracle'] )
       if result['OK'] and result['Value'][0] == 0:
         installOracleClient = True
 
@@ -237,7 +243,7 @@ class SystemAdministratorHandler( RequestHandler ):
     else:
       return S_ERROR( 'Local configuration not found' )
 
-    result = systemCall( 0, cmdList )
+    result = systemCall( 240, cmdList )
     if not result['OK']:
       return result
     status = result['Value'][0]
@@ -267,7 +273,7 @@ class SystemAdministratorHandler( RequestHandler ):
 
     # For LHCb we need to check Oracle client
     if installOracleClient:
-      result = systemCall( 0, 'install_oracle-client.sh' )
+      result = systemCall( 30, 'install_oracle-client.sh' )
       if not result['OK']:
         return result
       status = result['Value'][0]
@@ -278,6 +284,18 @@ class SystemAdministratorHandler( RequestHandler ):
         error.append( 'Failed to install Oracle client module' )
         return S_ERROR( '\n'.join( error ) )
     return S_OK()
+  
+  types_revertSoftware = [ ]
+  def export_revertSoftware( self ):
+    """ Revert the last installed version of software to the previous one
+    """
+    oldLink = os.path.join( InstallTools.instancePath, 'old' )
+    oldPath = os.readlink( oldLink )
+    proLink = os.path.join( InstallTools.instancePath, 'pro' )
+    os.remove(proLink)
+    os.symlink( oldPath, proLink )
+    
+    return S_OK( oldPath )
 
   def __loadDIRACCFG( self ):
     installPath = gConfig.getValue( '/LocalInstallation/TargetPath',
@@ -391,3 +409,122 @@ class SystemAdministratorHandler( RequestHandler ):
       resultDict[c] = {'ErrorsHour':errors_1, 'ErrorsDay':errors_24, 'LastError':lastError}
 
     return S_OK( resultDict )
+
+  types_getHostInfo = []
+  def export_getHostInfo(self):
+    """ Get host current loads, memory, etc
+    """
+
+    result = dict()
+    # Memory info
+    re_parser = re.compile(r'^(?P<key>\S*):\s*(?P<value>\d*)\s*kB' )
+    for line in open('/proc/meminfo'):
+      match = re_parser.match(line)
+      if not match:
+        continue
+      key, value = match.groups(['key', 'value'])
+      result[key] = int(value)
+
+    for mtype in ['Mem','Swap']:
+      memory = int(result.get(mtype+'Total'))
+      mfree = int(result.get(mtype+'Free'))
+      if memory > 0:
+        percentage = float(memory-mfree)/float(memory)*100.
+      else:
+        percentage = 0
+      name = 'Memory'
+      if mtype == "Swap":
+        name = 'Swap'
+      result[name] = '%.1f%%/%.1fMB' % (percentage,memory/1024.)
+
+    # Loads
+    line = open('/proc/loadavg').read()
+    l1,l5,l15,d1,d2 = line.split()
+    result['Load1'] = l1
+    result['Load5'] = l5
+    result['Load15'] = l15
+    result['Load'] = '/'.join([l1,l5,l15])
+    
+    # CPU info
+    lines = open( '/proc/cpuinfo', 'r' ).readlines()
+    processors = 0
+    physCores = {}
+    for line in lines:
+      if line.strip():
+        parameter, value = line.split(':')
+        parameter = parameter.strip()
+        value = value.strip()
+        if parameter.startswith('processor'):
+          processors += 1
+        if parameter.startswith('physical id'):
+          physCores[value] = parameter
+        if parameter.startswith('model name'):
+          result['CPUModel'] = value
+        if parameter.startswith('cpu MHz'):     
+          result['CPUClock'] = value
+    result['Cores'] = processors
+    result['PhysicalCores'] = len(physCores)      
+
+    # Disk occupancy
+    summary = ''
+    status,output = commands.getstatusoutput('df')
+    lines = output.split('\n')
+    for i in range( len( lines ) ):
+      if lines[i].startswith('/dev'):
+        fields = lines[i].split()
+        if len( fields ) == 1:
+          fields += lines[i+1].split()
+        disk = fields[0].replace('/dev/sd','')
+        partition = fields[5]
+        occupancy = fields[4]
+        summary += ",%s:%s" % (partition,occupancy)
+    result['DiskOccupancy'] = summary[1:]
+    result['RootDiskSpace'] = Os.getDiskSpace( DIRAC.rootPath )
+    
+    # Open files
+    puser= getpass.getuser()
+    status,output = commands.getstatusoutput('lsof')
+    pipes = 0
+    files = 0
+    sockets = 0
+    lines = output.split('\n')
+    for line in lines:
+      fType = line.split()[4]
+      user = line.split()[2]
+      if user == puser:
+        if fType in ['REG']:
+          files += 1
+        elif fType in ['unix','IPv4']:
+          sockets += 1
+        elif fType in ['FIFO']:
+          pipes += 1
+    result['OpenSockets'] = sockets
+    result['OpenFiles'] = files
+    result['OpenPipes'] = pipes
+    
+    infoResult = InstallTools.getInfo( getCSExtensions() )
+    if infoResult['OK']:
+      result.update( infoResult['Value'] )
+
+    # Host certificate properties
+    certFile,keyFile = getHostCertificateAndKeyLocation()
+    chain = X509Chain()
+    chain.loadChainFromFile( certFile )
+    resultCert = chain.getCredentials()
+    if resultCert['OK']:
+      result['SecondsLeft'] = resultCert['Value']['secondsLeft']
+      result['CertificateValidity'] = str( timedelta( seconds = resultCert['Value']['secondsLeft'] ) )
+      result['CertificateDN'] = resultCert['Value']['subject']
+      result['HostProperties'] = ','.join( resultCert['Value']['groupProperties'] )
+      result['CertificateIssuer'] = resultCert['Value']['issuer']
+
+    # Host uptime
+    try:
+      upFile = open('/proc/uptime', 'r')
+      uptime_seconds = float(upFile.readline().split()[0])
+      upFile.close()
+      result['Uptime'] = str(timedelta(seconds = uptime_seconds))
+    except:
+      pass
+
+    return S_OK(result)

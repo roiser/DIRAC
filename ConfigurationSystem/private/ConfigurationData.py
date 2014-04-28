@@ -4,7 +4,7 @@ __RCSID__ = "$Id$"
 import os.path
 import zlib
 import zipfile
-import threading
+import threading, thread
 import time
 import DIRAC
 from DIRAC.Core.Utilities import List, Time
@@ -17,9 +17,9 @@ class ConfigurationData:
 
   def __init__( self, loadDefaultCFG = True ):
     lr = LockRing()
-    self.threadingEvent = lr.getEvent( "configdata.dangerZone" )
+    self.threadingEvent = lr.getEvent()
     self.threadingEvent.set()
-    self.threadingLock = lr.getLock( "configdata.update" )
+    self.threadingLock = lr.getLock()
     self.runningThreadsNumber = 0
     self.compressedConfigurationData = ""
     self.configurationPath = "/DIRAC/Configuration"
@@ -337,9 +337,7 @@ class ConfigurationData:
     fd.write( str( self.remoteCFG ) )
     fd.close()
 
-  def __backupCurrentConfiguration( self, backupName = False ):
-    if not backupName:
-      backupName = self.getVersion()
+  def __backupCurrentConfiguration( self, backupName ):
     configurationFilename = "%s.cfg" % self.getName()
     configurationFile = os.path.join( DIRAC.rootPath, "etc", configurationFilename )
     today = Time.date()
@@ -372,7 +370,8 @@ class ConfigurationData:
       gLogger.fatal( "Cannot write new configuration to disk!",
                      "file %s" % configurationFile )
       return S_ERROR( "Can't write cs file %s!: %s" % ( configurationFile, str( e ) ) )
-    self.__backupCurrentConfiguration( backupName )
+    if backupName:
+      self.__backupCurrentConfiguration( backupName )
     return S_OK()
 
   def setRemoteCFG( self, cfg, disableSync = False ):
@@ -406,8 +405,10 @@ class ConfigurationData:
     self.threadingEvent.wait()
     self.threadingLock.acquire()
     self.runningThreadsNumber += 1
-    self.threadingLock.release()
-
+    try:
+      self.threadingLock.release()
+    except thread.error:
+      pass
 
   def dangerZoneEnd( self, returnValue = None ):
     """
@@ -416,5 +417,8 @@ class ConfigurationData:
     """
     self.threadingLock.acquire()
     self.runningThreadsNumber -= 1
-    self.threadingLock.release()
+    try:
+      self.threadingLock.release()
+    except thread.error:
+      pass
     return returnValue

@@ -16,11 +16,13 @@ gSynchro = ThreadSafe.Synchronizer()
 
 class AccountingDB( DB ):
 
-  def __init__( self, name = 'Accounting/AccountingDB', maxQueueSize = 10 ):
+  def __init__( self, name = 'Accounting/AccountingDB', maxQueueSize = 10, readOnly = False ):
     DB.__init__( self, 'AccountingDB', name, maxQueueSize )
     self.maxBucketTime = 604800 #1 w
     self.autoCompact = False
+    self.__readOnly = readOnly
     self.__doingCompaction = False
+    self.__oldBucketMethod = False
     self.__doingPendingLockTime = 0
     self.__deadLockRetries = 2
     self.__queuedRecordsLock = ThreadSafe.Synchronizer()
@@ -33,9 +35,9 @@ class AccountingDB( DB ):
     self.__threadPool.daemonize()
     self.catalogTableName = _getTableName( "catalog", "Types" )
     self._createTables( { self.catalogTableName : { 'Fields' : { 'name' : "VARCHAR(64) UNIQUE NOT NULL",
-                                                          'keyFields' : "VARCHAR(256) NOT NULL",
-                                                          'valueFields' : "VARCHAR(256) NOT NULL",
-                                                          'bucketsLength' : "VARCHAR(256) NOT NULL",
+                                                          'keyFields' : "VARCHAR(255) NOT NULL",
+                                                          'valueFields' : "VARCHAR(255) NOT NULL",
+                                                          'bucketsLength' : "VARCHAR(255) NOT NULL",
                                                        },
                                              'PrimaryKey' : 'name'
                                            }
@@ -118,7 +120,7 @@ class AccountingDB( DB ):
           bucketsLength.sort()
           if bucketsLength != self.dbBucketsLength[ typeName ]:
             bucketsLength = self.dbBucketsLength[ typeName ]
-            self.log.error( "Bucket length has changed for type %s" % typeName )
+            self.log.warn( "Bucket length has changed for type %s" % typeName )
           keyFields = [ f[0] for f in definitionKeyFields ]
           if keyFields != self.dbCatalog[ typeName ][ 'keys' ]:
             keyFields = self.dbCatalog[ typeName ][ 'keys' ]
@@ -132,11 +134,12 @@ class AccountingDB( DB ):
                                     definitionAccountingFields, bucketsLength )
         if not retVal[ 'OK' ]:
           self.log.error( "Can't register type %s:%s" % ( typeName, retVal[ 'Message' ] ) )
-        #Set the timespan
-        self.dbCatalog[ typeName ][ 'dataTimespan' ] = typeClass().getDataTimespan()
-        self.dbCatalog[ typeName ][ 'definition' ] = { 'keys' : definitionKeyFields,
-                                                       'values' : definitionAccountingFields }
-
+        #If it has been properly registered, update info
+        elif retVal[ 'Value' ]:
+          #Set the timespan
+          self.dbCatalog[ typeName ][ 'dataTimespan' ] = typeClass().getDataTimespan()
+          self.dbCatalog[ typeName ][ 'definition' ] = { 'keys' : definitionKeyFields,
+                                                         'values' : definitionAccountingFields }
     return S_OK()
 
   def __loadCatalogFromDB( self ):
@@ -185,15 +188,28 @@ class AccountingDB( DB ):
     pending = 0
     now = Time.toEpoch()
     recordsPerSlot = self.getCSOption( "RecordsPerSlot", 100 )
-    for typeName in self.dbCatalog:
+    allTypes = self.dbCatalog.keys()
+    random.shuffle( allTypes )
+    for typeName in allTypes:
       self.log.info( "[PENDING] Checking %s" % typeName )
+      sqlTableName = _getTableName( "in", typeName )
+      result = self._query( "SELECT COUNT(id) FROM `%s`" % sqlTableName )
+      if result[ 'OK' ]:
+        incount = result[ 'Value' ][0][0]
+        self.log.info( "%s IN records for %s" % ( incount, typeName ) )
+        try:
+          gMonitor.addMark( "registerwaiting:%s" % typeName, incount )
+        except:
+          pass
+      else:
+        self.log.warn( "Could not count IN records for %s: %s" % ( typeName, result[ 'Value' ] ) )
       pendingInQueue = self.__threadPool.pendingJobs()
       emptySlots = max( 0, 3000 - pendingInQueue )
       self.log.info( "[PENDING] %s in the queue, %d empty slots" % ( pendingInQueue, emptySlots ) )
       if emptySlots < 1:
+        self.log.info( "[PENDING] No more empty slots." )
         continue
       emptySlots = min( 100, emptySlots )
-      sqlTableName = _getTableName( "in", typeName )
       sqlFields = [ 'id' ] + self.dbCatalog[ typeName ][ 'typeFields' ]
       sqlCond = "WHERE taken = 0 or TIMESTAMPDIFF( SECOND, takenSince, UTC_TIMESTAMP() ) > %s" % self.getWaitingRecordsLifeTime()
       result = self._query( "SELECT %s FROM `%s` %s ORDER BY id ASC LIMIT %d" % ( ", ".join( [ "`%s`" % f for f in sqlFields ] ),
@@ -273,6 +289,11 @@ class AccountingDB( DB ):
     """
     Register a new type
     """
+    gMonitor.registerActivity( "registerwaiting:%s" % name,
+                               "Records waiting for insertion for %s" % " ".join( name.split( "_" ) ),
+                               "Accounting",
+                               "records",
+                               gMonitor.OP_MEAN )
     gMonitor.registerActivity( "registeradded:%s" % name,
                                "Register added for %s" % " ".join( name.split( "_" ) ),
                                "Accounting",
@@ -309,7 +330,7 @@ class AccountingDB( DB ):
       if keyTableName not in tablesInThere:
         self.log.info( "Table for key %s has to be created" % key[0] )
         tables[ keyTableName  ] = { 'Fields' : { 'id' : 'INTEGER NOT NULL AUTO_INCREMENT',
-                                                 'value' : '%s UNIQUE NOT NULL' % key[1]
+                                                 'value' : '%s NOT NULL' % key[1]
                                                },
                                     'UniqueIndexes' : { 'valueindex' : [ 'value' ] },
                                     'PrimaryKey' : 'id'
@@ -318,10 +339,10 @@ class AccountingDB( DB ):
     fieldsDict = {}
     bucketFieldsDict = {}
     inbufferDict = { 'id' : 'INTEGER NOT NULL AUTO_INCREMENT' }
-    indexesDict = {}
-    uniqueIndexFields = []
+    bucketIndexes = { 'startTimeIndex' : [ 'startTime' ], 'bucketLengthIndex' : [ 'bucketLength' ] }
+    uniqueIndexFields = ['startTime']
     for field in definitionKeyFields:
-      indexesDict[ "%sIndex" % field[0] ] = [ field[0] ]
+      bucketIndexes[ "%sIndex" % field[0] ] = [ field[0] ]
       uniqueIndexFields.append( field[ 0 ] )
       fieldsDict[ field[0] ] = "INTEGER NOT NULL"
       bucketFieldsDict[ field[0] ] = "INTEGER NOT NULL"
@@ -338,32 +359,33 @@ class AccountingDB( DB ):
     inbufferDict[ 'endTime' ] = "INT UNSIGNED NOT NULL"
     inbufferDict[ 'taken' ] = "TINYINT(1) DEFAULT 1 NOT NULL"
     inbufferDict[ 'takenSince' ] = "DATETIME NOT NULL"
-    uniqueIndexFields.append( 'startTime' )
     bucketFieldsDict[ 'bucketLength' ] = "MEDIUMINT UNSIGNED NOT NULL"
     uniqueIndexFields.append( 'bucketLength' )
     bucketTableName = _getTableName( "bucket", name )
     if bucketTableName not in tablesInThere:
-      bucketIndexes = dict( indexesDict )
-      bucketIndexes.update( { 'startTimeIndex' : [ 'startTime' ],
-                              'bucketLengthIndex' : [ 'bucketLength' ] } )
       tables[ bucketTableName ] = { 'Fields' : bucketFieldsDict,
-                                      'Indexes' : bucketIndexes,
-                                      'UniqueIndexes' : { 'UniqueConstraint' : uniqueIndexFields }
-                                    }
+                                    'UniqueIndexes' : { 'UniqueConstraint' : uniqueIndexFields }
+                                  }
     typeTableName = _getTableName( "type", name )
     if typeTableName not in tablesInThere:
-      typeIndexes = dict( indexesDict )
-      typeIndexes.update( { 'startTimeIndex' : [ 'startTime' ],
-                            'endTimeIndex' : [ 'endTime' ] } )
-      tables[ typeTableName ] = { 'Fields' : fieldsDict,
-                                    'Indexes' : indexesDict,
-                                  }
+      tables[ typeTableName ] = { 'Fields' : fieldsDict }
     inTableName = _getTableName( "in", name )
     if inTableName not in tablesInThere:
       tables[ inTableName ] = { 'Fields' : inbufferDict,
-                                    'Indexes' : { 'idIndex' : [ 'id' ] },
-                                    'PrimaryKey' : 'id'
-                                  }
+                                'PrimaryKey' : 'id'
+                              }
+    if self.__readOnly:
+      if tables:
+        self.log.notice( "ReadOnly mode: Skipping create of tables for %s. Removing from memory catalog" % name )
+        self.log.verbose( "Skipping creation of tables %s" % ", ".join( [ tn for tn in tables ] ) )
+        try:
+          self.dbCatalog.pop( name )
+        except KeyError:
+          pass
+      else:
+        self.log.notice( "ReadOnly mode: %s is OK" % name )
+      return S_OK( not updateDBCatalog )
+
     if tables:
       retVal = self._createTables( tables )
       if not retVal[ 'OK' ]:
@@ -372,12 +394,12 @@ class AccountingDB( DB ):
     if updateDBCatalog:
       bucketsLength.sort()
       bucketsEncoding = DEncode.encode( bucketsLength )
-      self._insert( self.catalogTableName,
-                    [ 'name', 'keyFields', 'valueFields', 'bucketsLength' ],
-                    [ name, ",".join( keyFieldsList ), ",".join( valueFieldsList ), bucketsEncoding ] )
+      self.insertFields( self.catalogTableName,
+                         [ 'name', 'keyFields', 'valueFields', 'bucketsLength' ],
+                         [ name, ",".join( keyFieldsList ), ",".join( valueFieldsList ), bucketsEncoding ] )
       self.__addToCatalog( name, keyFieldsList, valueFieldsList, bucketsLength )
     self.log.info( "Registered type %s" % name )
-    return S_OK()
+    return S_OK( True )
 
   def getRegisteredTypes( self ):
     """
@@ -438,6 +460,8 @@ class AccountingDB( DB ):
     """
     Deletes a type
     """
+    if self.__readOnly:
+      return S_ERROR( "ReadOnly mode enabled. No modification allowed" )
     if typeName not in self.dbCatalog:
       return S_ERROR( "Type %s does not exist" % typeName )
     self.log.info( "Deleting type", typeName )
@@ -502,7 +526,7 @@ class AccountingDB( DB ):
       return retVal
     connection = retVal[ 'Value' ]
     self.log.info( "Value %s for key %s didn't exist, inserting" % ( keyValue, keyName ) )
-    retVal = self._insert( keyTable, [ 'id', 'value' ], [ 0, keyValue ], connection )
+    retVal = self.insertFields( keyTable, [ 'id', 'value' ], [ 0, keyValue ], connection )
     if not retVal[ 'OK' ] and retVal[ 'Message' ].find( "Duplicate key" ) == -1:
       return retVal
     result = self.__getIdForKeyValue( typeName, keyName, keyValue, connection )
@@ -557,7 +581,7 @@ class AccountingDB( DB ):
       return S_ERROR( "Fields mismatch for record %s. %s fields and %s expected" % ( typeName,
                                                                                      numRcv,
                                                                                      numExp ) )
-    retVal = self._insert( _getTableName( "in", typeName ),
+    retVal = self.insertFields( _getTableName( "in", typeName ),
                            sqlFields,
                            sqlValues )
     if not retVal[ 'OK' ]:
@@ -565,6 +589,8 @@ class AccountingDB( DB ):
     return S_OK( retVal[ 'lastRowId' ] )
 
   def insertRecordBundleThroughQueue( self, recordsToQueue ) :
+    if self.__readOnly:
+      return S_ERROR( "ReadOnly mode enabled. No modification allowed" )
     recordsToProcess = []
     now = Time.toEpoch()
     for record in recordsToQueue:
@@ -581,6 +607,8 @@ class AccountingDB( DB ):
     """
     Insert a record in the intable to be really insterted afterwards
     """
+    if self.__readOnly:
+      return S_ERROR( "ReadOnly mode enabled. No modification allowed" )
     self.log.info( "Adding record to queue", "for type %s\n [%s -> %s]" % ( typeName, Time.fromEpoch( startTime ), Time.fromEpoch( endTime ) ) )
     if not typeName in self.dbCatalog:
       return S_ERROR( "Type %s has not been defined in the db" % typeName )
@@ -612,6 +640,8 @@ class AccountingDB( DB ):
     """
     Add an entry to the type contents
     """
+    if self.__readOnly:
+      return S_ERROR( "ReadOnly mode enabled. No modification allowed" )
     gMonitor.addMark( "registeradded", 1 )
     gMonitor.addMark( "registeradded:%s" % typeName, 1 )
     self.log.info( "Adding record", "for type %s\n [%s -> %s]" % ( typeName, Time.fromEpoch( startTime ), Time.fromEpoch( endTime ) ) )
@@ -634,7 +664,7 @@ class AccountingDB( DB ):
       return retVal
     connObj = retVal[ 'Value' ]
     try:
-      retVal = self._insert( _getTableName( "type", typeName ),
+      retVal = self.insertFields( _getTableName( "type", typeName ),
                              self.dbCatalog[ typeName ][ 'typeFields' ],
                              insertList,
                              conn = connObj )
@@ -657,6 +687,8 @@ class AccountingDB( DB ):
     """
     Add an entry to the type contents
     """
+    if self.__readOnly:
+      return S_ERROR( "ReadOnly mode enabled. No modification allowed" )
     self.log.info( "Deleting record record", "for type %s\n [%s -> %s]" % ( typeName, Time.fromEpoch( startTime ), Time.fromEpoch( endTime ) ) )
     if not typeName in self.dbCatalog:
       return S_ERROR( "Type %s has not been defined in the db" % typeName )
@@ -698,24 +730,15 @@ class AccountingDB( DB ):
     retVal = self.__startTransaction( connObj )
     if not retVal[ 'OK' ]:
       return retVal
-    retVal = self._query( "SELECT COUNT( startTime ) FROM `%s` WHERE %s" % ( mainTable,
-                                                                             " AND ".join( sqlCond ) ),
-                          conn = connObj )
-    if not retVal[ 'OK' ]:
-      return retVal
-    #Record is not in the db
-    if len( retVal[ 'Value' ] ) == 0:
-      return S_OK( 0 )
-    numInsertions = retVal[ 'Value' ][0][0]
-    if numInsertions == 0:
-      return S_OK( 0 )
-    #Delete from type
     retVal = self._update( "DELETE FROM `%s` WHERE %s" % ( mainTable, " AND ".join( sqlCond ) ),
                            conn = connObj )
     if not retVal[ 'OK' ]:
       return retVal
+    numInsertions = retVal[ 'Value' ]
     #Deleted from type, now the buckets
     #HACK: One more record to split in the buckets to be able to count total entries
+    if numInsertions == 0:
+      return S_OK( 0 )
     sqlValues.append( 1 )
     retVal = self.__deleteFromBuckets( typeName, startTime, endTime, sqlValues, numInsertions, connObj = connObj )
     if not retVal[ 'OK' ]:
@@ -738,39 +761,7 @@ class AccountingDB( DB ):
     keyValues = valuesList[ :numKeys ]
     valuesList = valuesList[ numKeys: ]
     self.log.verbose( "Splitting entry", " in %s buckets" % len( buckets ) )
-    for bucketInfo in buckets:
-      bucketStartTime = bucketInfo[0]
-      bucketProportion = bucketInfo[1]
-      bucketLength = bucketInfo[2]
-      #INSERT!
-      retVal = self.__insertBucket( typeName,
-                                    bucketStartTime,
-                                    bucketLength,
-                                    keyValues,
-                                    valuesList, bucketProportion, connObj = connObj )
-      #If OK insert is successful
-      if retVal[ 'OK' ]:
-        continue
-      #if not OK and NOT duplicate keys error then real error
-      if retVal[ 'Message' ].find( 'Duplicate entry' ) == -1:
-        return retVal
-      #Duplicate keys!!. If that's the case..
-      #Update!
-      for i in range( max( 1, self.__deadLockRetries ) ):
-        retVal = self.__updateBucket( typeName,
-                                      bucketStartTime,
-                                      bucketLength,
-                                      keyValues,
-                                      valuesList, bucketProportion, connObj = connObj )
-        if not retVal[ 'OK' ]:
-          #If failed because of dead lock try restarting
-          if retVal[ 'Message' ].find( "try restarting transaction" ):
-            continue
-          return retVal
-        #If OK, break loop
-        if retVal[ 'OK' ]:
-          break
-    return S_OK()
+    return self.__writeBuckets( typeName, buckets, keyValues, valuesList, connObj = connObj )
 
   def __deleteFromBuckets( self, typeName, startTime, endTime, valuesList, numInsertions, connObj = False ):
     """
@@ -831,7 +822,7 @@ class AccountingDB( DB ):
       sqlFields.append( "`%s`.`%s`" % ( tableName, valueField ) )
     sqlFields.append( "`%s`.`entriesInBucket`" % ( tableName ) )
     cmd = "SELECT %s FROM `%s`" % ( ", ".join( sqlFields ), _getTableName( "bucket", typeName ) )
-    cmd += " WHERE `%s`.`startTime`='%s' AND `%s`.`bucketLength`='%s' AND " % ( 
+    cmd += " WHERE `%s`.`startTime`='%s' AND `%s`.`bucketLength`='%s' AND " % (
                                                                               tableName,
                                                                               startTime,
                                                                               tableName,
@@ -850,13 +841,13 @@ class AccountingDB( DB ):
       valueField = self.dbCatalog[ typeName ][ 'values' ][ pos ]
       value = bucketValues[ pos ]
       fullFieldName = "`%s`.`%s`" % ( tableName, valueField )
-      sqlValList.append( "%s=%s-(%s*%s)" % ( fullFieldName, fullFieldName, value, proportion ) )
-    sqlValList.append( "`%s`.`entriesInBucket`=`%s`.`entriesInBucket`-(%s*%s)" % ( tableName,
-                                                                                    tableName,
-                                                                                    bucketValues[-1],
-                                                                                    proportion ) )
+      sqlValList.append( "%s=GREATEST(0,%s-(%s*%s))" % ( fullFieldName, fullFieldName, value, proportion ) )
+    sqlValList.append( "`%s`.`entriesInBucket`=GREATEST(0,`%s`.`entriesInBucket`-(%s*%s))" % ( tableName,
+                                                                                               tableName,
+                                                                                               bucketValues[-1],
+                                                                                               proportion ) )
     cmd += ", ".join( sqlValList )
-    cmd += " WHERE `%s`.`startTime`='%s' AND `%s`.`bucketLength`='%s' AND " % ( 
+    cmd += " WHERE `%s`.`startTime`='%s' AND `%s`.`bucketLength`='%s' AND " % (
                                                                             tableName,
                                                                             startTime,
                                                                             tableName,
@@ -864,46 +855,49 @@ class AccountingDB( DB ):
     cmd += self.__generateSQLConditionForKeys( typeName, keyValues )
     return self._update( cmd, conn = connObj )
 
-  def __updateBucket( self, typeName, startTime, bucketLength, keyValues, bucketValues, proportion, connObj = False ):
-    """
-    Update a bucket when coming from the raw insert
+
+  def __writeBuckets( self, typeName, buckets, keyValues, valuesList, connObj = False ):
+    """ Insert or update a bucket
     """
     tableName = _getTableName( "bucket", typeName )
-    cmd = "UPDATE `%s` SET " % tableName
-    sqlValList = []
-    for pos in range( len( self.dbCatalog[ typeName ][ 'values' ] ) ):
-      valueField = self.dbCatalog[ typeName ][ 'values' ][ pos ]
-      value = bucketValues[ pos ]
-      fullFieldName = "`%s`.`%s`" % ( tableName, valueField )
-      sqlValList.append( "%s=%s+(%s*%s)" % ( fullFieldName, fullFieldName, value, proportion ) )
-    sqlValList.append( "`%s`.`entriesInBucket`=`%s`.`entriesInBucket`+(%s*%s)" % ( tableName,
-                                                                                    tableName,
-                                                                                    bucketValues[-1],
-                                                                                    proportion ) )
-    cmd += ", ".join( sqlValList )
-    cmd += " WHERE `%s`.`startTime`='%s' AND `%s`.`bucketLength`='%s' AND " % ( 
-                                                                            tableName,
-                                                                            startTime,
-                                                                            tableName,
-                                                                            bucketLength )
-    cmd += self.__generateSQLConditionForKeys( typeName, keyValues )
-    return self._update( cmd, conn = connObj )
-
-  def __insertBucket( self, typeName, startTime, bucketLength, keyValues, bucketValues, proportion, connObj = False ):
-    """
-    Insert a bucket when coming from the raw insert
-    """
+    #INSERT PART OF THE QUERY
     sqlFields = [ '`startTime`', '`bucketLength`', '`entriesInBucket`' ]
-    sqlValues = [ startTime, bucketLength, "(%s*%s)" % ( bucketValues[-1], proportion )]
     for keyPos in range( len( self.dbCatalog[ typeName ][ 'keys' ] ) ):
       sqlFields.append( "`%s`" % self.dbCatalog[ typeName ][ 'keys' ][ keyPos ] )
-      sqlValues.append( keyValues[ keyPos ] )
+    sqlUpData = [ "`entriesInBucket`=`entriesInBucket`+VALUES(`entriesInBucket`)" ]
     for valPos in range( len( self.dbCatalog[ typeName ][ 'values' ] ) ):
-      sqlFields.append( "`%s`" % self.dbCatalog[ typeName ][ 'values' ][ valPos ] )
-      sqlValues.append( "(%s*%s)" % ( bucketValues[ valPos ], proportion ) )
+      valueField = "`%s`" % self.dbCatalog[ typeName ][ 'values' ][ valPos ]
+      sqlFields.append( valueField )
+      sqlUpData.append( "%s=%s+VALUES(%s)" % ( valueField, valueField, valueField ) )
+    valuesGroups = []
+    for bucketInfo in buckets:
+      bStartTime = bucketInfo[0]
+      bProportion = bucketInfo[1]
+      bLength = bucketInfo[2]
+      sqlValues = [ bStartTime, bLength, "(%s*%s)" % ( valuesList[-1], bProportion )]
+      for keyPos in range( len( self.dbCatalog[ typeName ][ 'keys' ] ) ):
+        sqlValues.append( keyValues[ keyPos ] )
+      for valPos in range( len( self.dbCatalog[ typeName ][ 'values' ] ) ):
+        value = valuesList[ valPos ]
+        sqlValues.append( "(%s*%s)" % ( valuesList[ valPos ], bProportion ) )
+      valuesGroups.append( "( %s )" % ",".join( str( val ) for val in sqlValues ) )
+
     cmd = "INSERT INTO `%s` ( %s ) " % ( _getTableName( "bucket", typeName ), ", ".join( sqlFields ) )
-    cmd += "VALUES ( %s )" % ", ".join( [ str( val ) for val in sqlValues ] )
-    return self._update( cmd, conn = connObj )
+    cmd += "VALUES %s " % ", ".join( valuesGroups)
+    cmd += "ON DUPLICATE KEY UPDATE %s" % ", ".join( sqlUpData )
+
+    for i in range( max( 1, self.__deadLockRetries ) ):
+      result = self._update( cmd, conn = connObj )
+      if not result[ 'OK' ]:
+        #If failed because of dead lock try restarting
+        if result[ 'Message' ].find( "try restarting transaction" ):
+          continue
+        return result
+      #If OK, break loopo
+      if result[ 'OK' ]:
+        return result
+
+    return S_ERROR( "Cannot update bucket: %s" % result[ 'Message' ] )
 
   def __checkFieldsExistsInType( self, typeName, fields, tableType ):
     """
@@ -933,6 +927,20 @@ class AccountingDB( DB ):
         return S_ERROR( "Order fields %s are not defined" % ", ".join( missing ) )
     return S_OK()
 
+  def retrieveRawRecords( self, typeName, startTime, endTime, condDict, orderFields, connObj = False ):
+    """
+    Get RAW data from the DB
+    """
+    if typeName not in self.dbCatalog:
+      return S_ERROR( "Type %s not defined" % typeName )
+    selectFields = [ [ "%s", "%s" ], [ "startTime", "endTime" ] ]
+    for tK in ( 'keys', 'values' ):
+      for key in self.dbCatalog[ typeName ][ tK ]:
+        selectFields[ 0 ].append( "%s" )
+        selectFields[ 1 ].append( key )
+    selectFields[ 0 ] = ", ".join( selectFields[ 0 ] )
+    return self.__queryType( typeName, startTime, endTime, selectFields,
+                             condDict, False, orderFields, "type" )
 
   def retrieveBucketedData( self, typeName, startTime, endTime, selectFields, condDict, groupFields, orderFields, connObj = False ):
     """
@@ -1017,10 +1025,16 @@ class AccountingDB( DB ):
     #Calculate time conditions
     sqlTimeCond = []
     if startTime:
+      if tableType == 'bucket':
+        #HACK because MySQL and UNIX do not start epoch at the same time
+        startTime = startTime + 3600
+        startTime = self.calculateBuckets( typeName, startTime, startTime )[0][0]
       sqlTimeCond.append( "`%s`.`startTime` >= %s" % ( tableName, startTime ) )
     if endTime:
       if tableType == "bucket":
         endTimeSQLVar = "startTime"
+        endTime = endTime + 3600
+        endTime = self.calculateBuckets( typeName, endTime, endTime )[0][0]
       else:
         endTimeSQLVar = "endTime"
       sqlTimeCond.append( "`%s`.`%s` <= %s" % ( tableName, endTimeSQLVar, endTime ) )
@@ -1058,9 +1072,12 @@ class AccountingDB( DB ):
                                                                         field,
                                                                         _getTableName( "key", typeName, field )
                                                                       ) )
-            preGenFields[1][i] = "`%s`.Value" % _getTableName( "key", typeName, field )
-          else:
-            preGenFields[1][i] = "`%s`.`%s`" % ( tableName, field )
+            if preGenFields[0] != "%s":
+              # The default grouping was changed
+              preGenFields[1][i] = "`%s`.Value" % _getTableName( "key", typeName, field )
+            else:
+              # The default grouping is maintained
+              preGenFields[1][i] = "`%s`.`%s`" % ( tableName, field )
     if sqlLinkList:
       cmd += " AND %s" % " AND ".join( sqlLinkList )
     if groupFields:
@@ -1074,6 +1091,8 @@ class AccountingDB( DB ):
     """
     Compact buckets for all defined types
     """
+    if self.__readOnly:
+      return S_ERROR( "ReadOnly mode enabled. No modification allowed" )
     gSynchro.lock()
     try:
       if self.__doingCompaction:
@@ -1144,10 +1163,6 @@ class AccountingDB( DB ):
     Compact all buckets for a given type
     """
     nowEpoch = Time.toEpoch()
-    retVal = self._getConnection()
-    if not retVal[ 'OK' ]:
-      return retVal
-    connObj = retVal[ 'Value' ]
     #retVal = self.__startTransaction( connObj )
     #if not retVal[ 'OK' ]:
     #  return retVal
@@ -1159,7 +1174,7 @@ class AccountingDB( DB ):
       nextBucketLength = self.dbBucketsLength[ typeName ][ bPos + 1 ][1]
       self.log.info( "[COMPACT] Compacting data newer that %s with bucket size %s" % ( Time.fromEpoch( timeLimit ), bucketLength ) )
       #Retrieve the data
-      retVal = self.__selectForCompactBuckets( typeName, timeLimit, bucketLength, nextBucketLength, connObj )
+      retVal = self.__selectForCompactBuckets( typeName, timeLimit, bucketLength, nextBucketLength )
       if not retVal[ 'OK' ]:
         #self.__rollbackTransaction( connObj )
         return retVal
@@ -1167,7 +1182,7 @@ class AccountingDB( DB ):
       self.log.info( "[COMPACT] Got %d records to compact" % len( bucketsData ) )
       if len( bucketsData ) == 0:
         continue
-      retVal = self.__deleteForCompactBuckets( typeName, timeLimit, bucketLength, connObj )
+      retVal = self.__deleteForCompactBuckets( typeName, timeLimit, bucketLength )
       if not retVal[ 'OK' ]:
         #self.__rollbackTransaction( connObj )
         return retVal
@@ -1177,13 +1192,12 @@ class AccountingDB( DB ):
         startTime = record[-2]
         endTime = record[-1]
         valuesList = record[:-2]
-        retVal = self.__splitInBuckets( typeName, startTime, endTime, valuesList, connObj )
+        retVal = self.__splitInBuckets( typeName, startTime, endTime, valuesList )
         if not retVal[ 'OK' ]:
           #self.__rollbackTransaction( connObj )
           self.log.error( "[COMPACT] Error while compacting data for record in %s: %s" % ( typeName, retVal[ 'Value' ] ) )
       self.log.info( "[COMPACT] Finished compaction %d of %d" % ( bPos, len( self.dbBucketsLength[ typeName ] ) - 1 ) )
     #return self.__commitTransaction( connObj )
-    connObj.close()
     return S_OK()
 
   def __slowCompactBucketsForType( self, typeName ):
@@ -1191,10 +1205,6 @@ class AccountingDB( DB ):
     Compact all buckets for a given type
     """
     nowEpoch = Time.toEpoch()
-    retVal = self._getConnection()
-    if not retVal[ 'OK' ]:
-      return retVal
-    connObj = retVal[ 'Value' ]
     for bPos in range( len( self.dbBucketsLength[ typeName ] ) - 1 ):
       self.log.info( "[COMPACT] Query %d of %d" % ( bPos, len( self.dbBucketsLength[ typeName ] ) - 1 ) )
       secondsLimit = self.dbBucketsLength[ typeName ][ bPos ][0]
@@ -1211,7 +1221,7 @@ class AccountingDB( DB ):
                                                                                                        bucketLength ) )
         roundStartTime = time.time()
         result = self.__selectIndividualForCompactBuckets( typeName, timeLimit, bucketLength,
-                                                           nextBucketLength, querySize, connObj )
+                                                           nextBucketLength, querySize )
         if not result[ 'OK' ]:
           #self.__rollbackTransaction( connObj )
           return result
@@ -1224,7 +1234,7 @@ class AccountingDB( DB ):
         if len( bucketsData ) == 0:
           break
 
-        result = self.__deleteIndividualForCompactBuckets( typeName, bucketsData, connObj )
+        result = self.__deleteIndividualForCompactBuckets( typeName, bucketsData )
         if not result[ 'OK' ]:
           #self.__rollbackTransaction( connObj )
           return result
@@ -1237,7 +1247,7 @@ class AccountingDB( DB ):
           startTime = record[-2]
           endTime = record[-2] + record[-1]
           valuesList = record[:-2]
-          retVal = self.__splitInBuckets( typeName, startTime, endTime, valuesList, connObj )
+          retVal = self.__splitInBuckets( typeName, startTime, endTime, valuesList )
           if not retVal[ 'OK' ]:
             self.log.error( "[COMPACT] Error while compacting data for buckets in %s: %s" % ( typeName, retVal[ 'Value' ] ) )
         totalCompacted += len( bucketsData )
@@ -1246,7 +1256,6 @@ class AccountingDB( DB ):
                                                                                             insertElapsedTime / len( bucketsData ) ) )
       self.log.info( "[COMPACT] Finised compaction %d of %d" % ( bPos, len( self.dbBucketsLength[ typeName ] ) - 1 ) )
     #return self.__commitTransaction( connObj )
-    connObj.close()
     return S_OK()
 
   def __selectIndividualForCompactBuckets( self, typeName, timeLimit, bucketLength, nextBucketLength, querySize, connObj = False ):
@@ -1308,27 +1317,34 @@ class AccountingDB( DB ):
     for table, field in ( ( _getTableName( "type", typeName ), 'endTime' ),
                           ( _getTableName( "bucket", typeName ), 'startTime + bucketLength' ) ):
       self.log.info( "[COMPACT] Deleting old records for table %s" % table )
-      sqlCmd = "DELETE FROM `%s` WHERE %s < UNIX_TIMESTAMP()-%d" % ( table, field, dataTimespan )
-      result = self._update( sqlCmd )
-      if not result[ 'OK' ]:
-        self.log.error( "[COMPACT] Cannot delete old records", "Table: %s Timespan: %s Error: %s" % ( table,
-                                                                                          dataTimespan,
-                                                                                          result[ 'Message' ] ) )
-      else:
+      deleteLimit = 10000
+      deleted = deleteLimit
+      while deleted >= deleteLimit:
+        sqlCmd = "DELETE FROM `%s` WHERE %s < UNIX_TIMESTAMP()-%d LIMIT %d" % ( table, field, dataTimespan, deleteLimit )
+        result = self._update( sqlCmd )
+        if not result[ 'OK' ]:
+          self.log.error( "[COMPACT] Cannot delete old records", "Table: %s Timespan: %s Error: %s" % ( table,
+                                                                                            dataTimespan,
+                                                                                            result[ 'Message' ] ) )
+          break
         self.log.info( "[COMPACT] Deleted %d records for %s table" % ( result[ 'Value' ], table ) )
+        deleted = result[ 'Value' ]
+        time.sleep( 1 )
 
   def regenerateBuckets( self, typeName ):
-    retVal = self._getConnection()
-    if not retVal[ 'OK' ]:
-      return retVal
-    connObj = retVal[ 'Value' ]
+    if self.__readOnly:
+      return S_ERROR( "ReadOnly mode enabled. No modification allowed" )
+    #Delete old entries if any
+    if self.dbCatalog[ typeName ][ 'dataTimespan' ] > 0:
+      self.log.info( "[REBUCKET] Deleting records older that timespan for type %s" % typeName )
+      self.__deleteRecordsOlderThanDataTimespan( typeName )
+      self.log.info( "[REBUCKET] Done deleting old records" )
     rawTableName = _getTableName( "type", typeName )
     #retVal = self.__startTransaction( connObj )
     #if not retVal[ 'OK' ]:
     #  return retVal
     self.log.info( "[REBUCKET] Deleting buckets for %s" % typeName )
-    retVal = self._update( "DELETE FROM `%s`" % _getTableName( "bucket", typeName ),
-                           conn = connObj )
+    retVal = self._update( "DELETE FROM `%s`" % _getTableName( "bucket", typeName ) )
     if not retVal[ 'OK' ]:
       return retVal
     #Generate the common part of the query
@@ -1410,7 +1426,7 @@ class AccountingDB( DB ):
     for sqlQuery in sqlQueries:
       self.log.info( "[REBUCKET] Executing query #%s..." % queryNum )
       queryNum += 1
-      retVal = self._query( sqlQuery, conn = connObj )
+      retVal = self._query( sqlQuery )
       if not retVal[ 'OK' ]:
         self.log.error( "[REBUCKET] Can't retrieve data for rebucketing", retVal[ 'Message' ] )
         #self.__rollbackTransaction( connObj )
@@ -1418,19 +1434,28 @@ class AccountingDB( DB ):
       rawData = retVal[ 'Value' ]
       self.log.info( "[REBUCKET] Retrieved %s records" % len( rawData ) )
       rebucketedRecords = 0
+      startQuery = time.time()
+      startBlock = time.time()
+      numRecords = len( rawData )
       for entry in rawData:
         startT = entry[0]
         endT = entry[1]
         values = entry[2:]
-        retVal = self.__splitInBuckets( typeName, startT, endT, values, connObj = connObj )
+        retVal = self.__splitInBuckets( typeName, startT, endT, values )
         if not retVal[ 'OK' ]:
           #self.__rollbackTransaction( connObj )
           return retVal
         rebucketedRecords += 1
         if rebucketedRecords % 1000 == 0:
-          self.log.info( "[REBUCKET] Rebucketed %s records..." % rebucketedRecords )
+          queryAvg = rebucketedRecords / float( time.time() - startQuery )
+          blockAvg = 1000 / float( time.time() - startBlock )
+          startBlock = time.time()
+          perDone = 100 * rebucketedRecords / float ( numRecords )
+          expectedEnd = str( datetime.timedelta( seconds = int( ( numRecords - rebucketedRecords ) / blockAvg ) ) )
+          self.log.info( "[REBUCKET] Rebucketed %.2f%% %s (%.2f r/s block %.2f r/s query | ETA %s )..." % ( perDone, typeName,
+                                                                                                            blockAvg, queryAvg,
+                                                                                                            expectedEnd ) )
     #return self.__commitTransaction( connObj )
-    connObj.close()
     return S_OK()
 
 

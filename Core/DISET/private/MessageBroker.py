@@ -27,6 +27,7 @@ class MessageBroker:
     self.__trInOutLock = threading.Lock()
     self.__msgFactory = MessageFactory()
     self.__log = gLogger.getSubLogger( "MSGBRK" )
+    self.__listenThread = None
     if not transportPool:
       transportPool = getGlobalTransportPool()
     self.__trPool = transportPool
@@ -68,7 +69,7 @@ class MessageBroker:
       gLogger.exception( "Cannot add transport id" )
       result = S_ERROR( "Cannot add transport id" )
     if not result[ 'OK' ]:
-      self.__trPool.remove( trid )
+      self.__trPool.close( trid )
       return result
     return S_OK( trid )
 
@@ -106,8 +107,7 @@ class MessageBroker:
   # Listen to connections
 
   def __startListeningThread( self ):
-    threadDead = self.__listeningForMessages and not self.__listenThread.isAlive()
-    if not self.__listeningForMessages or threadDead:
+    if self.__listenThread is None or not self.__listenThread.isAlive() or not self.__listeningForMessages:
       self.__listeningForMessages = True
       self.__listenThread = threading.Thread( target = self.__listenAutoReceiveConnections )
       self.__listenThread.setDaemon( True )
@@ -231,7 +231,7 @@ class MessageBroker:
     if 'attrs' in msg:
       attrs = msg[ 'attrs' ]
       if type( attrs ) not in( types.TupleType, types.ListType ):
-        return S_ERROR( "Message args has to be a tuple or a list, not %s" % type( args ) )
+        return S_ERROR( "Message args has to be a tuple or a list, not %s" % type( attrs ) )
     else:
       attrs = None
     #Do we "unpack" or do we send the raw data to the callback?
@@ -409,11 +409,18 @@ class MessageBroker:
 
 class MessageSender:
 
-  def __init__( self, msgBroker ):
+  def __init__( self, serviceName, msgBroker ):
+    self.__serviceName = serviceName
     self.__msgBroker = msgBroker
 
-  def sendMessage( self, trid, msgName, *msgArgs ):
-    return self.__msgBroker.sendMessage( trid, msgName, msgArgs )
+  def getServiceName( self ):
+    return self.__serviceName
+
+  def sendMessage( self, trid, msgObj ):
+    return self.__msgBroker.sendMessage( trid, msgObj )
+
+  def createMessage( self, msgName ):
+    return self.__msgBroker.__msgFactory.createMessage( self.__serviceName, msgName )
 
 gMessageBroker = False
 def getGlobalMessageBroker():

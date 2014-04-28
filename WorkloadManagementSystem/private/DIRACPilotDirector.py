@@ -22,7 +22,8 @@ from DIRAC.Resources.Computing.ComputingElementFactory    import ComputingElemen
 from DIRAC.Resources.Computing.ComputingElement import getResourceDict
 from DIRAC.Core.Security import CS
 from DIRAC.FrameworkSystem.Client.ProxyManagerClient      import gProxyManager
-from DIRAC import S_OK, S_ERROR, DictCache, gConfig, rootPath
+from DIRAC import S_OK, S_ERROR, gConfig, rootPath
+from DIRAC.Core.Utilities.DictCache import DictCache
 
 ERROR_CE         = 'No CE available'
 ERROR_JDL        = 'Could not create Pilot script'
@@ -85,7 +86,7 @@ class DIRACPilotDirector(PilotDirector):
 
     self.computingElement = computingElementDict['CE']
 
-    self.log.debug( self.computingElement.getDynamicInfo() )
+    self.log.debug( self.computingElement.getCEStatus() )
 
     self.log.info( ' SiteName:', self.siteName )
 
@@ -169,23 +170,23 @@ class DIRACPilotDirector(PilotDirector):
     pilotOptions.append( "-n '%s'" % self.siteName)
 
     # submit pilots for every CE available
-    
+
     for CE in self.computingElementDict.keys():
       ceName = CE
       computingElement = self.computingElementDict[CE]['CE']
-      
+
       # add possible requirements from Site and CE
       for req, val in getResourceDict( ceName ).items():
         pilotOptions.append( "-o '/AgentJobRequirements/%s=%s'" % ( req, val ) )
-        
+
       ceConfigDict = self.computingElementDict[CE]
 
       if 'ClientPlatform' in ceConfigDict:
         pilotOptions.append( "-p '%s'" % ceConfigDict['ClientPlatform'])
-  
+
       if 'SharedArea' in ceConfigDict:
         pilotOptions.append( "-o '/LocalSite/SharedArea=%s'" % ceConfigDict['SharedArea'] )
-  
+
       if 'CPUScalingFactor' in ceConfigDict:
         pilotOptions.append( "-o '/LocalSite/CPUScalingFactor=%s'" % ceConfigDict['CPUScalingFactor'] )
 
@@ -197,11 +198,11 @@ class DIRACPilotDirector(PilotDirector):
       httpProxy = ''
       if 'HttpProxy' in ceConfigDict:
         httpProxy = ceConfigDict['HttpProxy']
-      
+
       pilotDir = ''
       if 'JobExecDir' in ceConfigDict:
         pilotExecDir = ceConfigDict['JobExecDir']
-  
+
       try:
         pilotScript = self._writePilotScript( workingDirectory, pilotOptions, proxy, httpProxy, pilotExecDir )
       except:
@@ -212,7 +213,7 @@ class DIRACPilotDirector(PilotDirector):
         except:
           pass
         return S_ERROR( ERROR_SCRIPT )
-  
+
       self.log.info("Pilots to submit: ", pilotsToSubmit)
       while submittedPilots < pilotsToSubmit:
         # Find out how many pilots can be submitted
@@ -239,7 +240,7 @@ class DIRACPilotDirector(PilotDirector):
           submittedPilots += 1
           # let the batch system some time to digest the submitted job
           time.sleep(1)
-          
+
       #next CE
 
     try:
@@ -286,7 +287,7 @@ import os, tempfile, sys, shutil, base64, bz2
 try:
   pilotExecDir = '%(pilotExecDir)s'
   if not pilotExecDir:
-    pilotExecDir = None 
+    pilotExecDir = None
   pilotWorkingDirectory = tempfile.mkdtemp( suffix = 'pilot', prefix = 'DIRAC_', dir = pilotExecDir )
   os.chdir( pilotWorkingDirectory )
   open( 'proxy', "w" ).write(bz2.decompress( base64.decodestring( "%(compressedAndEncodedProxy)s" ) ) )
@@ -318,11 +319,11 @@ os.system( cmd )
 shutil.rmtree( pilotWorkingDirectory )
 
 EOF
-""" % { 'compressedAndEncodedProxy': compressedAndEncodedProxy, 
-        'compressedAndEncodedPilot': compressedAndEncodedPilot, 
-        'compressedAndEncodedInstall': compressedAndEncodedInstall, 
-        'httpProxy': httpProxy, 
-        'pilotScript': os.path.basename(self.pilot), 
+""" % { 'compressedAndEncodedProxy': compressedAndEncodedProxy,
+        'compressedAndEncodedPilot': compressedAndEncodedPilot,
+        'compressedAndEncodedInstall': compressedAndEncodedInstall,
+        'httpProxy': httpProxy,
+        'pilotScript': os.path.basename(self.pilot),
         'installScript': os.path.basename(self.install),
         'pilotOptions': ' '.join( pilotOptions ),
         'pilotExecDir': pilotExecDir }
@@ -341,11 +342,11 @@ EOF
     #Assign VOMS attribute
     vomsAttr = CS.getVOMSAttributeForGroup( ownerGroup )
     if not vomsAttr:
-      self.log.info( "Downloading a proxy without VOMS extensions" )
+      self.log.info( "Downloading a proxy without VOMS extensions for %s@%s" % ( ownerDN, ownerGroup ) )
       return gProxyManager.downloadProxy( ownerDN, ownerGroup, limited = True,
                                           requiredTimeLeft = requiredTimeLeft )
     else:
-      self.log.info( "Downloading a proxy with '%s' VOMS extension" % vomsAttr )
+      self.log.info( "Downloading a proxy with '%s' VOMS extension for %s@%s" % ( vomsAttr, ownerDN, ownerGroup ) )
       return gProxyManager.downloadVOMSProxy( ownerDN,
                                      ownerGroup,
                                      limited = True,

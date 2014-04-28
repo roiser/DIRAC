@@ -12,16 +12,17 @@ from DIRAC import S_OK, S_ERROR
 
 from DIRAC.ConfigurationSystem.Client.ConfigurationData import gConfigurationData
 from DIRAC.ConfigurationSystem.private.Refresher import gRefresher
-from DIRAC.ConfigurationSystem.Client.PathFinder import getServiceSection, getAgentSection
+from DIRAC.ConfigurationSystem.Client.PathFinder import getServiceSection, getAgentSection, getExecutorSection
+from DIRAC.Core.Utilities.Devloader import Devloader
 
 class LocalConfiguration:
   """
     Main class to interface with Configuration of a running DIRAC Component.
 
-    For most cases this is handled via 
+    For most cases this is handled via
       - DIRAC.Core.Base.Script class for scripts
       - dirac-agent for agents
-      - dirac-service for services 
+      - dirac-service for services
   """
 
   def __init__( self, defaultSectionPath = "" ):
@@ -93,6 +94,12 @@ class LocalConfiguration:
                          self.__setUseCertByCmd )
     self.registerCmdOpt( "d", "debug", "Set debug mode (-dd is extra debug)",
                          self.__setDebugMode )
+    devLoader = Devloader()
+    if devLoader.enabled:
+      self.registerCmdOpt( "", "autoreload", "Automatically restart if there's any change in the module",
+                           self.__setAutoreload )
+    self.registerCmdOpt( "", "license", "Show DIRAC's LICENSE",
+                         self.showLicense )
     self.registerCmdOpt( "h", "help", "Shows this help",
                          self.showHelp )
 
@@ -141,7 +148,7 @@ class LocalConfiguration:
       for optionPath in self.mandatoryEntryList:
         optionPath = self.__getAbsolutePath( optionPath )
         if not gConfigurationData.extractOptionFromCFG( optionPath ):
-          gLogger.fatal( "Missing mandatory option in the configuration", optionPath )
+          gLogger.fatal( "Missing mandatory local configuration option", optionPath )
           isMandatoryMissing = True
       if isMandatoryMissing:
         return S_ERROR()
@@ -191,7 +198,7 @@ class LocalConfiguration:
     This is the magic method that reads the command line and processes it
     It is used by the Script Base class and the dirac-service and dirac-agent scripts
     Before being called:
-     - any additional switches to be processed 
+     - any additional switches to be processed
      - mandatory and default configuration configuration options
     must be defined.
     """
@@ -244,6 +251,11 @@ class LocalConfiguration:
       self.showHelp()
       sys.exit( 2 )
 
+    for o, v in opts:
+      if o in ( '-h', '--help' ):
+        self.showHelp()
+        sys.exit(2)
+
     self.cliAdditionalCFGFiles = [ arg for arg in args if arg[-4:] == ".cfg" ]
     self.commandArgList = [ arg for arg in args if not arg[-4:] == ".cfg" ]
     self.parsedOptionList = opts
@@ -291,6 +303,10 @@ class LocalConfiguration:
         self.__setDefaultSection( getServiceSection( self.componentName ) )
       elif self.componentType == "agent":
         self.__setDefaultSection( getAgentSection( self.componentName ) )
+      elif self.componentType == "executor":
+        self.__setDefaultSection( getExecutorSection( self.componentName ) )
+      elif self.componentType == "web":
+        self.__setDefaultSection( "/%s" % self.componentName )
       elif self.componentType == "script":
         if self.componentName and self.componentName[0] == "/":
           self.__setDefaultSection( self.componentName )
@@ -305,7 +321,7 @@ class LocalConfiguration:
     self.unprocessedSwitches = []
 
     for optionName, optionValue in self.parsedOptionList:
-      optionName = optionName.replace( "-", "" )
+      optionName = optionName.lstrip( "-" )
       for definedOptionTuple in self.commandOptionList:
         if optionName == definedOptionTuple[0].replace( ":", "" ) or \
           optionName == definedOptionTuple[1].replace( "=", "" ):
@@ -377,6 +393,20 @@ class LocalConfiguration:
     self.componentName = agentName
     self.componentType = "agent"
 
+  def setConfigurationForExecutor( self, executorName ):
+    """
+    Declare this is a DIRAC agent
+    """
+    self.componentName = executorName
+    self.componentType = "executor"
+
+  def setConfigurationForWeb( self, webName ):
+    """
+    Declare this is a DIRAC agent
+    """
+    self.componentName = webName
+    self.componentType = "web"
+
   def setConfigurationForScript( self, scriptName ):
     """
     Declare this is a DIRAC script
@@ -409,26 +439,54 @@ class LocalConfiguration:
     self.__debugMode += 1
     return S_OK()
 
+  def __setAutoreload( self, filepath = False ):
+    devLoader = Devloader()
+    devLoader.bootstrap()
+    if filepath:
+      devLoader.watchFile( filepath )
+    gLogger.notice( "Devloader started" )
+    return S_OK()
+
   def getDebugMode( self ):
     return self.__debugMode
+
+  def showLicense( self, dummy = False ):
+    """
+    Print license
+    """
+    lpath = os.path.join( DIRAC.rootPath, "DIRAC", "LICENSE" )
+    sys.stdout.write( " - DIRAC is GPLv3 licensed\n\n" )
+    try:
+      with open( lpath ) as fd:
+        sys.stdout.write( fd.read() )
+    except IOError:
+      sys.stdout.write( "Can't find GPLv3 license at %s. Somebody stole it!\n" % lpath )
+      sys.stdout.write( "Please check out http://www.gnu.org/licenses/gpl-3.0.html for more info\n" )
+    DIRAC.exit(0)
 
   def showHelp( self, dummy = False ):
     """
     Printout help message including a Usage message if defined via setUsageMessage method
     """
     if self.__usageMessage:
-      gLogger.notice( self.__usageMessage )
+      gLogger.notice( '\n'+self.__usageMessage.lstrip() )
     else:
-      gLogger.notice( "Usage:" )
-      gLogger.notice( "  %s (<options>|<cfgFile>)*" % os.path.basename( sys.argv[0] ) )
+      gLogger.notice( "\nUsage:" )
+      gLogger.notice( "\n  %s (<options>|<cfgFile>)*" % os.path.basename( sys.argv[0] ) )
       if dummy:
         gLogger.notice( dummy )
 
-    gLogger.notice( "General options:" )
+    gLogger.notice( "\nGeneral options:" )
     iLastOpt = 0
     for iPos in range( len( self.commandOptionList ) ):
       optionTuple = self.commandOptionList[ iPos ]
-      gLogger.notice( "  -%s --%s : %s" % ( optionTuple[0].ljust( 3 ), optionTuple[1].ljust( 15 ), optionTuple[2] ) )
+      if optionTuple[0].endswith( ':' ):
+        line = "  -%s --%s : %s" % ( optionTuple[0][:-1].ljust( 2 ),
+                                       (optionTuple[1][:-1] + ' <value> ').ljust( 22 ),
+                                       optionTuple[2] )
+        gLogger.notice( line )
+      else:
+        gLogger.notice( "  -%s --%s : %s" % ( optionTuple[0].ljust( 2 ), optionTuple[1].ljust( 22 ), optionTuple[2] ) )
       iLastOpt = iPos
       if optionTuple[0] == 'h':
         #Last general opt is always help
@@ -437,8 +495,15 @@ class LocalConfiguration:
       gLogger.notice( " \nOptions:" )
       for iPos in range( iLastOpt + 1, len( self.commandOptionList ) ):
         optionTuple = self.commandOptionList[ iPos ]
-        gLogger.notice( "  -%s --%s : %s" % ( optionTuple[0].ljust( 3 ), optionTuple[1].ljust( 15 ), optionTuple[2] ) )
+        if optionTuple[0].endswith( ':' ):
+          line = "\n  -%s --%s : %s" % ( optionTuple[0][:-1].ljust( 2 ),
+                                         (optionTuple[1][:-1] + ' <value> ').ljust( 22 ),
+                                         optionTuple[2] )
+          gLogger.notice( line )
+        else:
+          gLogger.notice( "\n  -%s --%s : %s" % ( optionTuple[0].ljust( 2 ), optionTuple[1].ljust( 22 ), optionTuple[2] ) )
 
+    gLogger.notice( "" )
     DIRAC.exit( 0 )
 
   def deleteOption( self, optionPath ):

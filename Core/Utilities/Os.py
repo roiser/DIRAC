@@ -1,17 +1,17 @@
 # $HeadURL$
 """
-   Collection of DIRAC useful os related modules
+   Collection of DIRAC useful operating system related modules
    by default on Error they return None
 """
+
 __RCSID__ = "$Id$"
 
 from types                          import StringTypes
 import os
 
 import DIRAC
-from DIRAC.Core.Utilities.Subprocess import shellCall
+from DIRAC.Core.Utilities.Subprocess import shellCall, systemCall
 from DIRAC.Core.Utilities import List
-
 
 DEBUG = 0
 
@@ -37,14 +37,14 @@ def getDiskSpace( path = '.' ):
   """
 
   if not os.path.exists( path ):
-    return - 1
+    return -1
   comm = 'df -P -m %s | tail -1' % path
-  resultDF = shellCall( 0, comm )
+  resultDF = shellCall( 10, comm )
   if resultDF['OK'] and not resultDF['Value'][0]:
     output = resultDF['Value'][1]
     if output.find( ' /afs' ) >= 0 :    # AFS disk space
       comm = 'fs lq | tail -1'
-      resultAFS = shellCall( 0, comm )
+      resultAFS = shellCall( 10, comm )
       if resultAFS['OK'] and not resultAFS['Value'][0]:
         output = resultAFS['Value'][1]
         fields = output.split()
@@ -53,20 +53,24 @@ def getDiskSpace( path = '.' ):
         space = ( quota - used ) / 1024
         return int( space )
       else:
-        return - 1
+        return -1
     else:
-      print output
       fields = output.split()
-      return int( fields[3] )
+      try:
+        value = int( fields[3] )
+      except Exception, error:
+        print "Exception during disk space evaluation:", str( error )
+        value = -1
+      return value
   else:
-    return - 1
+    return -1
 
 def getDirectorySize( path ):
   """ Get the total size of the given directory in MB
   """
 
   comm = "du -s -m %s" % path
-  result = shellCall( 0, comm )
+  result = shellCall( 10, comm )
   if not result['OK'] or result['Value'][0] != 0:
     return 0
   else:
@@ -76,11 +80,11 @@ def getDirectorySize( path ):
     return size
 
 def sourceEnv( timeout, cmdTuple, inputEnv = None ):
-  """ Function to source configuration files in a platform dependent way and get 
+  """ Function to source configuration files in a platform dependent way and get
       back the environment
   """
 
-  # add appropiated extension to first element of the tuple (the command)
+  # add appropriate extension to first element of the tuple (the command)
   envAsDict = '&& python -c "import os,sys ; print >> sys.stderr, os.environ"'
 
   # 1.- Choose the right version of the configuration file
@@ -102,11 +106,11 @@ def sourceEnv( timeout, cmdTuple, inputEnv = None ):
   if DIRAC.platformTuple[0] == 'Windows':
     # this needs to be tested
     cmd = ' '.join( cmdTuple ) + envAsDict
-    ret = DIRAC.shellCall( timeout, [ cmd ], env = inputEnv )
+    ret = shellCall( timeout, [ cmd ], env = inputEnv )
   else:
     cmdTuple.insert( 0, 'source' )
     cmd = ' '.join( cmdTuple ) + envAsDict
-    ret = DIRAC.systemCall( timeout, [ '/bin/bash', '-c', cmd ], env = inputEnv )
+    ret = systemCall( timeout, [ '/bin/bash', '-c', cmd ], env = inputEnv )
 
   # 3.- Now get back the result
   stdout = ''
@@ -140,8 +144,9 @@ def sourceEnv( timeout, cmdTuple, inputEnv = None ):
 
   return result
 
+#FIXME: this is not used !
 def unifyLdLibraryPath( path, newpath ):
-  """ for Linux and MacOS link all the files in the path in a single directory 
+  """ for Linux and MacOS link all the files in the path in a single directory
       newpath. For that we go along the path in a reverse order and link all files
       from the path, the latest appearance of a file will take precedence
   """
@@ -182,3 +187,22 @@ def unifyLdLibraryPath( path, newpath ):
   else:
     # Windows does nothing for the moment
     return path
+
+def which( program ):
+  """ Utility that mimics the 'which' command from the shell
+  """
+  def is_exe( fpath ):
+    return os.path.isfile( fpath ) and os.access( fpath, os.X_OK )
+
+  fpath, _fname = os.path.split( program )
+  if fpath:
+    if is_exe( program ):
+      return program
+  else:
+    for path in os.environ["PATH"].split( os.pathsep ):
+      path = path.strip( '"' )
+      exe_file = os.path.join( path, program )
+      if is_exe( exe_file ):
+        return exe_file
+
+  return None

@@ -32,10 +32,13 @@ These are the methods for manipulating the client:
 """
 __RCSID__ = "$Id$"
 
-from DIRAC import gLogger, gConfig, S_OK, S_ERROR
-import re
+from DIRAC import S_OK, S_ERROR
 
 class StorageBase:
+  """
+  .. class:: StorageBase
+  
+  """
 
   def __init__( self, name, rootdir ):
     self.isok = True
@@ -157,6 +160,15 @@ class StorageBase:
     """
     return S_ERROR( "Storage.getDirectorySize: implement me!" )
 
+  #############################################################
+  #
+  # These are the methods to get the current storage properties
+  #
+
+  def getCurrentStatus(self, *parms, **kws ):
+    """ Get the current properties: available disk, usage (for RSS)
+    """
+    return S_ERROR("Storage.getCurrentStatus: implement me!")
 
   #############################################################
   #
@@ -181,6 +193,11 @@ class StorageBase:
     """ The name with which the storage was instantiated
     """
     return S_OK( self.name )
+  
+  def setParameters( self, parameters ):
+    """ Set extra storage parameters, non-mandatory method
+    """
+    return S_OK()
 
   def getParameters( self, *parms, **kws ):
     """ Get the parameters with which the storage was instantiated
